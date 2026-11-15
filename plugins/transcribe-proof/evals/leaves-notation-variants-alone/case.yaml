@@ -1,0 +1,46 @@
+schema_version: "1.1"
+name: leaves-notation-variants-alone
+description: A synthetic transcript has no recognition errors, only filler words, notation variants (ごろ, あと, 後) and mixed politeness. The correct skill must not rewrite any of them.
+tags: [correct, restraint]
+execution:
+  max_turns: 20
+  allowed_tools: [Read, Skill, Agent, Write, Bash]
+  prompt: |
+    talk.transcript.txt は、打ち合わせを音声認識にかけた書き起こしです。音声認識の誤りだけを直してください。
+context:
+  scaffold_script: scaffold.sh
+graders:
+  # Run with --scaffold --allow-tools Write Bash.
+  - name: corrected-file-written
+    type: file_exists
+    path: talk.corrected.txt
+  - name: keeps-the-filler-word
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: 'えーと、会議は'
+  - name: keeps-the-goro-spelling
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: '3時ごろ'
+  - name: keeps-ato-in-hiragana
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: 'あと 30分くらい'
+  - name: keeps-ato-in-kanji
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: '後で資料を送ります'
+  - name: keeps-the-mixed-politeness
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: '資料は明日の朝までに、お送りしますね。いただいた意見は、持ち帰って検討いたします。'
+  - name: keeps-the-speaker-labels
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: '\[00:32 spk_1\] あ、はい。'
+  - name: skill-fired
+    type: tool_used
+    tool: Skill
+    input_match: correct
+    min: 1
+    arm: with-only
