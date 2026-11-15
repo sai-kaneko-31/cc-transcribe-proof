@@ -123,6 +123,13 @@ expect_code 'a denied status read fails verify' 1
 expect_out 'reports the get check as NG' 'check transcribe-get: NG'
 expect_calls 'a denied status read still deletes the probe job' 1 'delete-transcription-job'
 
+# ---- a bucket with versioning keeps deleted objects as old versions ----
+ready
+: > "$state/versioned"
+run_wrapper verify
+expect_code 'a versioned bucket fails verify' 1
+expect_out 'reports the versioned bucket in the read-write check' 'check bucket-rw: NG the bucket has versioning on'
+
 # ---- the bucket upload fails ----
 ready
 : > "$state/fail-put-object"
@@ -138,7 +145,7 @@ ready
 run_wrapper verify
 expect_code 'a denied start exits 1' 1
 expect_out 'reports the start check as NG' 'check transcribe-start: NG'
-expect_calls 'a denied start deletes no job' 0 'delete-transcription-job'
+expect_no_out 'a denied start does not report a leftover job' 'WARNING'
 [ "$(leftover_objects)" -eq 0 ] && ok 'a denied start still removes the probe objects' || bad "$(leftover_objects) objects left after a denied start"
 
 # ---- Transcribe delete is denied: the job name is shown so it can be removed by hand ----
@@ -166,5 +173,14 @@ envs=$(ls "$state"/env-*.txt | wc -l | tr -d ' ')
 n_key=$(printf '%s\n' "$all_env" | grep -c -x -F -e "AWS_ACCESS_KEY_ID=$key_id")
 [ "$n_key" -eq "$envs" ] && ok 'every verify call uses the plugin access key' || bad "plugin key in $n_key of $envs calls"
 if printf '%s\n' "$all_env" | grep -q -e '^AWS_PROFILE=' -e '^AWS_ENDPOINT_URL='; then bad 'a profile or endpoint override reaches aws'; else ok 'no profile or endpoint override reaches aws'; fi
+
+# ---- the user's HOME does not reach the AWS CLI ----
+ready
+mkdir -p "$sb/home"
+wenv+=("HOME=$sb/home")
+run_wrapper verify
+expect_code 'verify passes with another HOME' 0
+home_hits=$(grep -c -x -F -e "HOME=$sb/home" "$state"/env-*.txt | awk -F: '{s += $2} END {print s + 0}')
+[ "$home_hits" -eq 0 ] && ok "no aws call sees the user's HOME" || bad "$home_hits aws calls saw the user's HOME"
 
 finish

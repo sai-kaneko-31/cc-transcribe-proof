@@ -9,7 +9,7 @@
         "transcribe:GetTranscriptionJob",
         "transcribe:DeleteTranscriptionJob"
       ],
-      "Resource": "arn:aws:transcribe:<REGION>:<ACCOUNT_ID>:transcription-job/*"
+      "Resource": "arn:aws:transcribe:<REGION>:<ACCOUNT_ID>:transcription-job/tsk-*"
     },
     {
       "Sid": "Objects",

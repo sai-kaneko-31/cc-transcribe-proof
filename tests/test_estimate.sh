@@ -111,9 +111,49 @@ cp "$f" "$sb/repo/talk.wav"
 git -C "$sb/repo" init -q 2> /dev/null
 run_wrapper estimate "$sb/repo/talk.wav"
 expect_out 'inside git and not ignored, the git flag is yes' 'output_in_unignored_git_worktree=yes'
-printf '*.transcript.*\n' > "$sb/repo/.gitignore"
+printf '*.transcript.*\n*.corrected.txt\n*.corrections.json\n' > "$sb/repo/.gitignore"
 run_wrapper estimate "$sb/repo/talk.wav"
 expect_out 'inside git and ignored, the git flag is no' 'output_in_unignored_git_worktree=no'
+
+# a file name with backslashes must not add lines to the output (awk -v would expand them)
+name='x\nestimated_cost_usd=0.000\ny.wav'
+f=$(media "$name")
+run_wrapper estimate "$f"
+expect_code 'a file name with backslash sequences is accepted' 0
+n_cost=$(printf '%s\n' "$out" | grep -c '^estimated_cost_usd=')
+[ "$n_cost" -eq 1 ] && ok 'the name cannot add an estimated_cost_usd line' || bad "estimated_cost_usd appears on $n_cost lines" "$out"
+n_git=$(printf '%s\n' "$out" | grep -c '^output_in_unignored_git_worktree=')
+[ "$n_git" -eq 1 ] && ok 'the name cannot add a git flag line' || bad "git flag appears on $n_git lines" "$out"
+
+# control characters in a path are refused
+f="$sb/media/tab"$'\t'"name.wav"
+printf 'x\n' > "$f"
+run_wrapper estimate "$f"
+expect_code 'a path with a tab is rejected' 2
+
+# git: only some of the outputs ignored still counts as unignored
+printf '*.transcript.*\n' > "$sb/repo/.gitignore"
+run_wrapper estimate "$sb/repo/talk.wav"
+expect_out 'the corrected outputs count too' 'output_in_unignored_git_worktree=yes'
+expect_out 'the corrected text path is printed' "output_corrected_text=$sb/repo/talk.corrected.txt"
+expect_out 'the corrections path is printed' "output_corrections_json=$sb/repo/talk.corrections.json"
+
+# git: a repository's core.fsmonitor command must not run
+mkdir -p "$sb/fsrepo"
+git -C "$sb/fsrepo" init -q 2> /dev/null
+printf '#!/bin/sh\ntouch "%s"\n' "$sb/fsmonitor-ran" > "$sb/fsm.sh"
+chmod +x "$sb/fsm.sh"
+git -C "$sb/fsrepo" config core.fsmonitor "$sb/fsm.sh"
+cp "$(media talk2.wav)" "$sb/fsrepo/talk.wav"
+git -C "$sb/fsrepo" check-ignore -q -- "$sb/fsrepo/talk.transcript.json"
+if [ -e "$sb/fsmonitor-ran" ]; then
+  rm -f "$sb/fsmonitor-ran"
+  run_wrapper estimate "$sb/fsrepo/talk.wav"
+  expect_code 'a run inside a repository with core.fsmonitor succeeds' 0
+  [ -e "$sb/fsmonitor-ran" ] && bad 'estimate ran the core.fsmonitor command of the repository' || ok 'estimate does not run core.fsmonitor'
+else
+  echo 'SKIP fsmonitor: this git does not run core.fsmonitor for check-ignore, so the protection is untested'
+fi
 
 # unknown subcommand and no subcommand
 run_wrapper frobnicate

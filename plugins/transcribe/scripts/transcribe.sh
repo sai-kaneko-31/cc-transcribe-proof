@@ -89,7 +89,12 @@ setup_aws_env() {
   export AWS_PAGER=''
 }
 
-aws_call() { aws --region "$T_REGION" "$@"; }
+# aws and jq run with an empty HOME, so ~/.aws/cli/alias (which can replace a
+# command) and ~/.jq (which can redefine jq builtins) are never read.
+SAFE_HOME=''
+setup_safe_home() { SAFE_HOME=$(mktemp -d) || die 'cannot make a temporary directory'; }
+aws_call() { HOME="$SAFE_HOME" aws --region "$T_REGION" "$@"; }
+jq_safe() { HOME="$SAFE_HOME" jq "$@"; }
 
 # ---- input ----
 # validate_input <file>: sets INPUT, INPUT_BYTES, INPUT_SECONDS, OUT_DIR, OUT_JSON, OUT_TXT.
@@ -97,7 +102,7 @@ validate_input() {
   local f="${1-}" dir base ext e ok bytes secs name
   [ -n "$f" ] || die 'no file given'
   case "$f" in
-    *$'\n'* | *$'\r'*) die 'the path contains a line break' ;;
+    *[[:cntrl:]]*) die 'the path contains a control character or a line break' ;;
   esac
   [ -L "$f" ] && die "the file is a symbolic link; give the real file: $f"
   [ -e "$f" ] || die "no such file: $f"
@@ -134,72 +139,117 @@ validate_input() {
   OUT_DIR=$dir
   OUT_JSON="$dir/$name.transcript.json"
   OUT_TXT="$dir/$name.transcript.txt"
+  OUT_CORRECTED="$dir/$name.corrected.txt"
+  OUT_CORRECTIONS="$dir/$name.corrections.json"
 }
 
+# exists_or_link <path>: true for a file, a directory or a dangling symbolic link.
+exists_or_link() { [ -e "$1" ] || [ -L "$1" ]; }
+
+# Refuses to start when any output name is taken, before any money is spent: the
+# corrected files are written by a later step that would otherwise fail.
 refuse_existing_outputs() {
-  [ ! -e "$OUT_JSON" ] || die "the output already exists, not overwriting: $OUT_JSON"
-  [ ! -e "$OUT_TXT" ] || die "the output already exists, not overwriting: $OUT_TXT"
+  local f
+  for f in "$OUT_JSON" "$OUT_TXT" "$OUT_CORRECTED" "$OUT_CORRECTIONS"; do
+    ! exists_or_link "$f" || die "the output already exists, not overwriting: $f"
+  done
 }
 
 # git_unignored <path>: true when the path is inside a git work tree and git does not ignore it.
+# core.fsmonitor is switched off: it names a command that git would run, and a
+# repository's own config must not be able to run one here.
 git_unignored() {
   command -v git > /dev/null 2>&1 || return 1
-  git -C "$(dirname "$1")" rev-parse --is-inside-work-tree > /dev/null 2>&1 || return 1
-  git -C "$(dirname "$1")" check-ignore -q -- "$1" && return 1
+  git -c core.fsmonitor=false -C "$(dirname "$1")" rev-parse --is-inside-work-tree > /dev/null 2>&1 || return 1
+  git -c core.fsmonitor=false -C "$(dirname "$1")" check-ignore -q -- "$1" && return 1
   return 0
+}
+
+# git_unignored_any <paths...>: true when any of the paths is unignored in a git work tree.
+git_unignored_any() {
+  local f
+  for f in "$@"; do
+    git_unignored "$f" && return 0
+  done
+  return 1
 }
 
 # ---- estimate ----
 cmd_estimate() {
-  local git_flag=no
+  local git_flag=no cost secs
   validate_input "${1-}"
-  if git_unignored "$OUT_JSON" || git_unignored "$OUT_TXT"; then git_flag=yes; fi
-  awk -v d="$INPUT_SECONDS" -v p="$UNIT_PRICE" -v b="$INPUT_BYTES" -v f="$INPUT" -v lm="$((MAX_SECONDS / 60))" -v lb="$MAX_BYTES" \
-    -v oj="$OUT_JSON" -v ot="$OUT_TXT" -v g="$git_flag" 'BEGIN {
-    printf "file=%s\n", f
-    printf "size_bytes=%d\n", b
-    printf "duration_seconds=%d\n", d + 0.5
-    printf "estimated_cost_usd=%.3f\n", d / 60 * p
-    printf "unit_price_usd_per_minute=%s\n", p
-    printf "price_basis=estimate from the Amazon Transcribe price page batch example for us-east-1; the price for your region may differ\n"
-    printf "limit_duration_minutes=%d\n", lm
-    printf "limit_size_bytes=%d\n", lb
-    printf "output_json=%s\n", oj
-    printf "output_text=%s\n", ot
-    printf "output_in_unignored_git_worktree=%s\n", g
-  }'
+  if git_unignored_any "$OUT_JSON" "$OUT_TXT" "$OUT_CORRECTED" "$OUT_CORRECTIONS"; then git_flag=yes; fi
+  cost=$(awk -v d="$INPUT_SECONDS" -v p="$UNIT_PRICE" 'BEGIN { printf "%.3f", d / 60 * p }')
+  secs=$(awk -v d="$INPUT_SECONDS" 'BEGIN { printf "%d", d + 0.5 }')
+  # The path is printed with printf %s: it may contain backslashes that awk would expand into line breaks.
+  printf 'file=%s\n' "$INPUT"
+  printf 'size_bytes=%s\n' "$INPUT_BYTES"
+  printf 'duration_seconds=%s\n' "$secs"
+  printf 'estimated_cost_usd=%s\n' "$cost"
+  printf 'unit_price_usd_per_minute=%s\n' "$UNIT_PRICE"
+  printf 'price_basis=estimate from the Amazon Transcribe price page batch example for us-east-1; the price for your region may differ\n'
+  printf 'limit_duration_minutes=%s\n' "$((MAX_SECONDS / 60))"
+  printf 'limit_size_bytes=%s\n' "$MAX_BYTES"
+  printf 'output_json=%s\n' "$OUT_JSON"
+  printf 'output_text=%s\n' "$OUT_TXT"
+  printf 'output_corrected_text=%s\n' "$OUT_CORRECTED"
+  printf 'output_corrections_json=%s\n' "$OUT_CORRECTIONS"
+  printf 'output_in_unignored_git_worktree=%s\n' "$git_flag"
 }
 
 # ---- run ----
 CLEANUP_NEEDED=0
-JOB_CREATED=0
+JOB_STATE=0    # 0 not started, 1 start was attempted (the job may exist), 2 the job exists
+JOB_FINISHED=0 # 1 once the job was seen COMPLETED or FAILED
 LEFT=''
 TMP_JSON=''
 TMP_TXT=''
 ACCOUNT=''
 IN_KEY=''
 OUT_KEY=''
+CHECK_KEY='' # an empty file that Amazon Transcribe leaves under the output key (seen against real AWS)
 JOB=''
 
+# delete_key <key>: deletes one object. On a bucket with versioning, S3 answers with
+# a delete marker and the object stays as an old version, so that is reported.
+delete_key() {
+  local marker
+  marker=$(aws_call s3api delete-object --bucket "$T_BUCKET" --key "$1" --expected-bucket-owner "$ACCOUNT" \
+    --query DeleteMarker --output text 2> /dev/null) || {
+    LEFT="$LEFT s3://$T_BUCKET/$1"
+    return 0
+  }
+  case "$marker" in
+    True | true) LEFT="$LEFT s3://$T_BUCKET/$1 (the bucket has versioning on, so the object stays as an old version)" ;;
+  esac
+}
+
+# The audio goes first (it is the most sensitive), then the job, then what the job wrote.
 cleanup_aws() {
   [ "$CLEANUP_NEEDED" -eq 1 ] || return 0
   CLEANUP_NEEDED=0
-  if [ "$JOB_CREATED" -eq 1 ]; then
+  delete_key "$IN_KEY"
+  if [ "$JOB_STATE" -ge 1 ]; then
+    # After a failed start the job may not exist, so a failed delete is not reported then.
     aws_call transcribe delete-transcription-job --transcription-job-name "$JOB" > /dev/null 2>&1 \
-      || LEFT="$LEFT transcription-job:$JOB"
+      || { [ "$JOB_STATE" -eq 2 ] && LEFT="$LEFT transcription-job:$JOB"; }
   fi
-  aws_call s3api delete-object --bucket "$T_BUCKET" --key "$IN_KEY" --expected-bucket-owner "$ACCOUNT" > /dev/null 2>&1 \
-    || LEFT="$LEFT s3://$T_BUCKET/$IN_KEY"
-  aws_call s3api delete-object --bucket "$T_BUCKET" --key "$OUT_KEY" --expected-bucket-owner "$ACCOUNT" > /dev/null 2>&1 \
-    || LEFT="$LEFT s3://$T_BUCKET/$OUT_KEY"
+  delete_key "$CHECK_KEY"
+  delete_key "$OUT_KEY"
+  if [ "$JOB_STATE" -eq 2 ] && [ "$JOB_FINISHED" -eq 0 ]; then
+    LEFT="$LEFT s3://$T_BUCKET/$OUT_KEY (the job had not finished, so this result may still be written later)"
+  fi
 }
 
 on_exit() {
   local rc=$?
-  trap - EXIT INT TERM HUP
+  # Signals that arrive during cleanup must not cut it short.
+  trap '' INT TERM HUP
+  trap - EXIT
   cleanup_aws
   [ -n "$TMP_JSON" ] && rm -f "$TMP_JSON"
   [ -n "$TMP_TXT" ] && rm -f "$TMP_TXT"
+  [ -n "$SAFE_HOME" ] && rm -rf "$SAFE_HOME"
   if [ -n "$LEFT" ]; then
     warn "could not delete from AWS; delete by hand (the bucket's lifecycle rule removes objects after a day):$LEFT"
     [ "$rc" -eq 0 ] && rc=3
@@ -214,8 +264,12 @@ wait_for_job() {
     status=$(aws_call transcribe get-transcription-job --transcription-job-name "$JOB" \
       --query 'TranscriptionJob.TranscriptionJobStatus' --output text) || die 'could not read the job status' 1
     case "$status" in
-      COMPLETED) return 0 ;;
+      COMPLETED)
+        JOB_FINISHED=1
+        return 0
+        ;;
       FAILED)
+        JOB_FINISHED=1
         reason=$(aws_call transcribe get-transcription-job --transcription-job-name "$JOB" \
           --query 'TranscriptionJob.FailureReason' --output text 2> /dev/null)
         die "the job failed: $reason" 1
@@ -288,6 +342,7 @@ cmd_run() {
   validate_input "$file"
   refuse_existing_outputs
   setup_aws_env
+  setup_safe_home
 
   ACCOUNT=$(aws_call sts get-caller-identity --query Account --output text) || die 'could not read the AWS account for these keys' 1
   [[ $ACCOUNT =~ ^[0-9]{12}$ ]] || die 'the AWS account ID has an unexpected shape' 1
@@ -299,6 +354,7 @@ cmd_run() {
   JOB="tsk-$rid"
   IN_KEY="$prefix/in/audio.$INPUT_EXT"
   OUT_KEY="$out_prefix$JOB.json"
+  CHECK_KEY="${out_prefix}.write_access_check_file.temp"
 
   trap on_exit EXIT
   trap 'exit 130' INT
@@ -313,19 +369,20 @@ cmd_run() {
   aws_call s3api put-object --bucket "$T_BUCKET" --key "$IN_KEY" --body "$INPUT" \
     --expected-bucket-owner "$ACCOUNT" > /dev/null || die 'the upload failed' 1
 
+  JOB_STATE=1
   aws_call transcribe start-transcription-job --transcription-job-name "$JOB" \
     --language-code ja-JP --media "MediaFileUri=s3://$T_BUCKET/$IN_KEY" \
     --output-bucket-name "$T_BUCKET" --output-key "$out_prefix" \
     --settings "ShowSpeakerLabels=true,MaxSpeakerLabels=$speakers" \
     --query 'TranscriptionJob.TranscriptionJobStatus' --output text > /dev/null || die 'could not start the job' 1
-  JOB_CREATED=1
+  JOB_STATE=2
 
   wait_for_job
 
   aws_call s3api get-object --bucket "$T_BUCKET" --key "$OUT_KEY" \
     --expected-bucket-owner "$ACCOUNT" "$TMP_JSON" > /dev/null || die 'could not download the result' 1
-  jq -e '.results.items' "$TMP_JSON" > /dev/null 2>&1 || die 'the result is not a Transcribe result' 1
-  jq -r "$FORMAT_JQ" "$TMP_JSON" > "$TMP_TXT" || die 'could not build the text transcript' 1
+  jq_safe -e '.results.items' "$TMP_JSON" > /dev/null 2>&1 || die 'the result is not a Transcribe result' 1
+  jq_safe -r "$FORMAT_JQ" "$TMP_JSON" > "$TMP_TXT" || die 'could not build the text transcript' 1
 
   refuse_existing_outputs
   chmod 600 "$TMP_JSON" "$TMP_TXT"
@@ -336,8 +393,8 @@ cmd_run() {
 
   printf 'transcript_json=%s\n' "$OUT_JSON"
   printf 'transcript_text=%s\n' "$OUT_TXT"
-  if git_unignored "$OUT_JSON" || git_unignored "$OUT_TXT"; then
-    warn "the output is inside a git work tree and git does not ignore it; add the files to .gitignore or move them before you commit: $OUT_DIR"
+  if git_unignored_any "$OUT_JSON" "$OUT_TXT" "$OUT_CORRECTED" "$OUT_CORRECTIONS"; then
+    warn "the outputs (including the corrected files made later) are inside a git work tree and git does not ignore them; add *.transcript.* *.corrected.txt *.corrections.json to .gitignore or move the files before you commit: $OUT_DIR"
   fi
   exit 0
 }
@@ -361,7 +418,7 @@ is_denied() { printf '%s' "$1" | grep -q 'AccessDenied'; }
 # The Transcribe operations are tried on a text file posing as audio, which
 # makes a job that fails in seconds.
 cmd_verify() {
-  local problem arn rid prefix probe_key outside_key out rc polls status get_ok bucket_ok
+  local problem arn rid prefix probe_key outside_key out rc polls status get_ok bucket_ok versioned version_id
   problem=$(config_problem)
   if [ -n "$problem" ]; then
     check_ng env "$problem"
@@ -370,6 +427,7 @@ cmd_verify() {
   fi
   check_ok env
   setup_aws_env
+  setup_safe_home
 
   if ! ACCOUNT=$(aws_call sts get-caller-identity --query Account --output text 2> /dev/null) \
     || ! [[ $ACCOUNT =~ ^[0-9]{12}$ ]] \
@@ -391,6 +449,7 @@ cmd_verify() {
   JOB="tsk-$rid"
   IN_KEY="$prefix/probe/audio.wav"
   OUT_KEY="$prefix/out/$JOB.json"
+  CHECK_KEY="$prefix/out/.write_access_check_file.temp"
 
   trap on_exit EXIT
   trap 'exit 130' INT
@@ -412,9 +471,17 @@ cmd_verify() {
   fi
 
   bucket_ok=1
+  versioned=0
   printf 'verify-%s\n' "$rid" > "$TMP_TXT"
-  aws_call s3api put-object --bucket "$T_BUCKET" --key "$probe_key" --body "$TMP_TXT" \
-    --expected-bucket-owner "$ACCOUNT" > /dev/null 2>&1 || bucket_ok=0
+  version_id=$(aws_call s3api put-object --bucket "$T_BUCKET" --key "$probe_key" --body "$TMP_TXT" \
+    --expected-bucket-owner "$ACCOUNT" --query VersionId --output text 2> /dev/null) || bucket_ok=0
+  case "$version_id" in
+    '' | None) ;;
+    *)
+      versioned=1
+      bucket_ok=0
+      ;;
+  esac
   if [ "$bucket_ok" -eq 1 ]; then
     aws_call s3api get-object --bucket "$T_BUCKET" --key "$probe_key" \
       --expected-bucket-owner "$ACCOUNT" "$TMP_JSON" > /dev/null 2>&1 || bucket_ok=0
@@ -424,6 +491,8 @@ cmd_verify() {
   fi
   if [ "$bucket_ok" -eq 1 ]; then
     check_ok bucket-rw "put, get and delete work under $KEY_PREFIX/"
+  elif [ "$versioned" -eq 1 ]; then
+    check_ng bucket-rw 'the bucket has versioning on, so deleted objects stay as old versions; use a bucket without versioning'
   else
     check_ng bucket-rw "put, get or delete under $KEY_PREFIX/ failed; check the bucket name, the region and the Objects statement of the policy"
   fi
@@ -457,7 +526,7 @@ cmd_verify() {
     check_ng transcribe-start 'skipped: the probe upload failed'
     check_ng transcribe-get 'skipped: the probe job did not start'
     check_ng transcribe-delete 'skipped: the probe job did not start'
-  elif ! aws_call transcribe start-transcription-job --transcription-job-name "$JOB" \
+  elif JOB_STATE=1; ! aws_call transcribe start-transcription-job --transcription-job-name "$JOB" \
     --language-code ja-JP --media "MediaFileUri=s3://$T_BUCKET/$IN_KEY" \
     --output-bucket-name "$T_BUCKET" --output-key "$prefix/out/" \
     --query 'TranscriptionJob.TranscriptionJobStatus' --output text > /dev/null 2>&1; then
@@ -465,7 +534,7 @@ cmd_verify() {
     check_ng transcribe-get 'skipped: the probe job did not start'
     check_ng transcribe-delete 'skipped: the probe job did not start'
   else
-    JOB_CREATED=1
+    JOB_STATE=2
     check_ok transcribe-start 'a job was created; it is expected to end FAILED because the file is not audio'
     get_ok=0
     polls=0
@@ -490,7 +559,7 @@ cmd_verify() {
       check_ng transcribe-get 'could not read the job; check transcribe:GetTranscriptionJob in the policy'
     fi
     if aws_call transcribe delete-transcription-job --transcription-job-name "$JOB" > /dev/null 2>&1; then
-      JOB_CREATED=0
+      JOB_STATE=0
       check_ok transcribe-delete 'the probe job was deleted'
     else
       check_ng transcribe-delete "could not delete the probe job $JOB; check transcribe:DeleteTranscriptionJob in the policy and delete the job by hand"
@@ -512,52 +581,90 @@ readonly MAX_TEXT_BYTES=2000000
 read -r -d '' APPLY_JQ <<'JQ'
 def prefix_of: capture("^(?<p>\\[[0-9]+:[0-9]{2} [^\\]]*\\] )?(?<b>.*)$");
 def line_ok($max): type == "number" and . == floor and . >= 1 and . <= $max;
+# control, format, line and paragraph separator characters (this includes CR, tab, U+0085, U+2028, U+202E)
+def unsafe: test("[\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]");
+# counts overlapping occurrences too ("はは" occurs twice in "ははは")
+def occurrences($old):
+  . as $s | ($old | length) as $n
+  | if $n == 0 then 0 else [range(0; ($s | length) - $n + 1) | select($s[.:(. + $n)] == $old)] | length end;
 def reason_for($max):
   if type != "object" then "the edit is not an object"
   elif (.line | line_ok($max) | not) then "line is not a whole number within the transcript"
   elif ((.old | type) != "string") or ((.new | type) != "string") then "old and new must be strings"
   elif ((.reason | type) != "string") or (.reason == "") then "reason is missing"
+  elif (.reason | length) > 200 then "reason is too long (limit 200 characters)"
+  elif (.reason | unsafe) then "reason has a control or format character"
   elif (.confidence != "high" and .confidence != "medium") then "confidence must be high or medium (low confidence belongs in flags)"
   elif .old == "" then "old is empty"
+  elif (.old | length) > 100 then "old is too long (limit 100 characters); use a shorter part that is still unique in the line"
   elif .old == .new then "old and new are the same"
-  elif (.old | test("\n")) or (.new | test("\n")) then "old or new has a line break"
+  elif (.old | test("\n")) then "old has a line break"
+  elif (.new | unsafe) then "new has a control or format character (line breaks included)"
   elif (.new | length) > ((.old | length) * 3 + 20) then "new is too long compared with old"
+  else null end;
+def flag_reason_for($max):
+  if type != "object" then "the flag is not an object"
+  elif (.line | line_ok($max) | not) then "line is not a whole number within the transcript"
+  elif ((.text | type) != "string") or (.text == "") then "text is missing"
+  elif (.text | length) > 200 then "text is too long (limit 200 characters)"
+  elif (.text | unsafe) then "text has a control or format character"
+  elif ((.reason | type) != "string") or (.reason == "") then "reason is missing"
+  elif (.reason | length) > 200 then "reason is too long (limit 200 characters)"
+  elif (.reason | unsafe) then "reason has a control or format character"
   else null end;
 [inputs] as $lines
 | $e[0] as $edits
 | ($lines | length) as $max
-| reduce ($edits.edits | to_entries[]) as $entry ({lines: $lines, applied: [], rejected: [], flags: []};
+| def short($v): ($v | tojson | .[0:200]);
+  reduce ($edits.edits | to_entries[]) as $entry ({lines: $lines, applied: [], rejected: [], flags: []};
     $entry.value as $x
-    | ($x | reason_for($max)) as $why
-    | if $why then .rejected += [{edit: $x, reason: $why}]
+    | if $entry.key >= 200 then .rejected += [{item: short($x), reason: "too many edits (limit 200)"}]
       else
-        (.lines[$x.line - 1] | prefix_of) as $l
-        | (($l.b | split($x.old) | length) - 1) as $count
-        | if $count != 1 then
-            .rejected += [{edit: $x, reason: "old text not found exactly once in the line (found \($count) times)"}]
+        ($x | reason_for($max)) as $why
+        | if $why then .rejected += [{item: short($x), reason: $why}]
           else
-            .lines[$x.line - 1] = (($l.p // "") + ($l.b | split($x.old) | join($x.new)))
-            | .applied += [$x]
+            ($lines[$x.line - 1] | prefix_of | .b | length) as $orig_len
+            | (.lines[$x.line - 1] | prefix_of) as $l
+            | ($l.b | occurrences($x.old)) as $count
+            | if $count != 1 then
+                .rejected += [{item: short($x), reason: "old text not found exactly once in the line (found \($count) times)"}]
+              else
+                (($l.b | split($x.old) | join($x.new))) as $nb
+                | if ($nb | length) > ($orig_len * 1.5 + 20) then
+                    .rejected += [{item: short($x), reason: "the line would grow too much (limit 1.5 times the original plus 20 characters)"}]
+                  else
+                    .lines[$x.line - 1] = (($l.p // "") + $nb)
+                    | .applied += [$x]
+                  end
+              end
           end
       end)
-| reduce $edits.flags[] as $f (.;
-    if ($f | type) == "object" and ($f.line | line_ok($max)) and (($f.text | type) == "string") and (($f.reason | type) == "string")
-    then .flags += [{line: $f.line, text: $f.text[0:200], reason: $f.reason[0:200]}]
-    else .rejected += [{flag: $f, reason: "the flag is malformed or its line is out of range"}]
-    end)
+| reduce ($edits.flags | to_entries[]) as $entry (.;
+    $entry.value as $f
+    | if $entry.key >= 50 then .rejected += [{item: short($f), reason: "too many flags (limit 50)"}]
+      else
+        ($f | flag_reason_for($max)) as $why
+        | if $why then .rejected += [{item: short($f), reason: $why}]
+          elif (($lines[$f.line - 1] | prefix_of | .b | occurrences($f.text)) == 0) then
+            .rejected += [{item: short($f), reason: "the flag text is not in its line"}]
+          else .flags += [{line: $f.line, text: $f.text, reason: $f.reason}]
+          end
+      end)
 JQ
 
 cmd_apply() {
   local transcript="${1-}" editsfile="${2-}" f bytes dir base name out_corrected out_corrections result
   [ -n "$transcript" ] && [ -n "$editsfile" ] || die 'usage: transcribe.sh apply <transcript.txt> <edits.json>'
   command -v jq > /dev/null 2>&1 || die 'jq is required to apply the edits'
+  trap on_exit EXIT
+  setup_safe_home
   for f in "$transcript" "$editsfile"; do
     [ -L "$f" ] && die "a symbolic link is not accepted: $f"
     [ -f "$f" ] || die "no such file: $f"
     bytes=$(wc -c < "$f" | tr -d ' ')
     [ "$bytes" -le "$MAX_TEXT_BYTES" ] || die "the file is over $MAX_TEXT_BYTES bytes: $f"
   done
-  jq -e 'type == "object" and (.edits | type) == "array" and (.flags | type) == "array"' "$editsfile" > /dev/null 2>&1 \
+  jq_safe -e 'type == "object" and (.edits | type) == "array" and (.flags | type) == "array"' "$editsfile" > /dev/null 2>&1 \
     || die 'the edit file must be a JSON object with an "edits" array and a "flags" array'
 
   dir=$(cd -P "$(dirname "$transcript")" 2> /dev/null && pwd) || die "cannot open the directory of: $transcript"
@@ -569,16 +676,16 @@ cmd_apply() {
   esac
   out_corrected="$dir/$name.corrected.txt"
   out_corrections="$dir/$name.corrections.json"
-  [ ! -e "$out_corrected" ] || die "the output already exists, not overwriting: $out_corrected"
-  [ ! -e "$out_corrections" ] || die "the output already exists, not overwriting: $out_corrections"
+  ! exists_or_link "$out_corrected" || die "the output already exists, not overwriting: $out_corrected"
+  ! exists_or_link "$out_corrections" || die "the output already exists, not overwriting: $out_corrections"
 
   trap on_exit EXIT
   TMP_TXT=$(mktemp "$dir/.transcribe.XXXXXX") || die "cannot write in the directory: $dir"
   TMP_JSON=$(mktemp "$dir/.transcribe.XXXXXX") || die "cannot write in the directory: $dir"
 
-  result=$(jq -R -n --slurpfile e "$editsfile" "$APPLY_JQ" "$transcript") || die 'could not apply the edits' 1
-  printf '%s' "$result" | jq -r '.lines[]' > "$TMP_TXT" || die 'could not write the corrected text' 1
-  printf '%s' "$result" | jq '{applied, rejected, flags}' > "$TMP_JSON" || die 'could not write the corrections' 1
+  result=$(jq_safe -R -n --slurpfile e "$editsfile" "$APPLY_JQ" "$transcript") || die 'could not apply the edits' 1
+  printf '%s' "$result" | jq_safe -r '.lines[]' > "$TMP_TXT" || die 'could not write the corrected text' 1
+  printf '%s' "$result" | jq_safe '{applied, rejected, flags}' > "$TMP_JSON" || die 'could not write the corrections' 1
   chmod 600 "$TMP_TXT" "$TMP_JSON"
   mv "$TMP_TXT" "$out_corrected" || die 'could not write the corrected text' 1
   TMP_TXT=''
@@ -587,13 +694,16 @@ cmd_apply() {
 
   printf 'corrected_text=%s\n' "$out_corrected"
   printf 'corrections_json=%s\n' "$out_corrections"
-  printf '%s' "$result" | jq -r '
+  printf '%s' "$result" | jq_safe -r '
     "applied=\(.applied | length)",
     "rejected=\(.rejected | length)",
     "flagged=\(.flags | length)",
     (.applied[] | "edit line \(.line): \(.old) -> \(.new) (\(.confidence): \(.reason))"),
-    (.rejected[] | "rejected: \(.reason): \((.edit // .flag) | tojson | .[0:160])"),
+    (.rejected[] | "rejected: \(.reason): \(.item)"),
     (.flags[] | "flag line \(.line): \(.text) (\(.reason))")'
+  if git_unignored_any "$out_corrected" "$out_corrections"; then
+    warn "the corrected files are inside a git work tree and git does not ignore them; add *.corrected.txt *.corrections.json to .gitignore or move the files before you commit: $dir"
+  fi
   exit 0
 }
 

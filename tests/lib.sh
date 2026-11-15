@@ -49,6 +49,12 @@ argval() {
     shift
   done
 }
+# hang <name>: while $state/hang-<name> exists, wait (and say so in $state/hanging) until $state/release exists.
+hang() {
+  [ -e "$state/hang-$1" ] || return 0
+  : > "$state/hanging"
+  while [ ! -e "$state/release" ]; do /bin/sleep 0.05; done
+}
 n=$(ls "$state" | grep -c '^env-')
 env | sort > "$state/env-$n.txt"
 {
@@ -95,7 +101,10 @@ case "$op" in
     esac
     mkdir -p "$state/obj"
     cp "$(argval --body "$@")" "$state/obj/$(printf '%s' "$key" | tr '/' '_')"
-    echo '{"ETag":"fake"}'
+    case "$args" in
+      *VersionId*) if [ -e "$state/versioned" ]; then echo 'fakeversion1'; else echo 'None'; fi ;;
+      *) echo '{"ETag":"fake"}' ;;
+    esac
     ;;
   's3api get-object')
     for last in "$@"; do :; done
@@ -111,14 +120,27 @@ case "$op" in
     [ -e "$state/corrupt-get" ] && printf 'corrupted\n' > "$last"
     echo '{}'
     ;;
-  's3api delete-object') rm -f "$state/obj/$(printf '%s' "$(argval --key "$@")" | tr '/' '_')" ;;
+  's3api delete-object')
+    if [ -e "$state/versioned" ]; then
+      case "$args" in *DeleteMarker*) echo 'True' ;; esac
+    else
+      rm -f "$state/obj/$(printf '%s' "$(argval --key "$@")" | tr '/' '_')"
+      case "$args" in *DeleteMarker*) echo 'None' ;; esac
+    fi
+    ;;
   's3api list-objects-v2')
     if [ -e "$state/allow-list" ]; then echo '{"Contents":[]}'; else
       echo 'An error occurred (AccessDenied) when calling the ListObjectsV2 operation: fake denial' >&2
       exit 254
     fi
     ;;
-  'transcribe start-transcription-job') echo 'IN_PROGRESS' ;;
+  'transcribe start-transcription-job')
+    hang start
+    # Amazon Transcribe leaves an empty check file under the output key (seen against real AWS)
+    mkdir -p "$state/obj"
+    : > "$state/obj/$(printf '%s' "$(argval --output-key "$@").write_access_check_file.temp" | tr '/' '_')"
+    echo 'IN_PROGRESS'
+    ;;
   'transcribe get-transcription-job')
     c=$(cat "$state/get-count" 2> /dev/null || echo 0)
     echo $((c + 1)) > "$state/get-count"
@@ -129,7 +151,7 @@ case "$op" in
       *) echo "$s" ;;
     esac
     ;;
-  'transcribe delete-transcription-job') : ;;
+  'transcribe delete-transcription-job') hang delete ;;
   *) echo "unexpected fake aws call: $op" >&2; exit 99 ;;
 esac
 FAKE
@@ -204,7 +226,7 @@ base_env() {
 }
 
 fresh() {
-  rm -f "$state"/calls.log "$state"/env-*.txt "$state"/get-count "$state"/fail-* "$state"/broad-key "$state"/root-arn "$state"/corrupt-get "$state"/allow-*
+  rm -f "$state"/calls.log "$state"/env-*.txt "$state"/get-count "$state"/fail-* "$state"/broad-key "$state"/root-arn "$state"/corrupt-get "$state"/versioned "$state"/hang-* "$state"/hanging "$state"/release "$state"/allow-*
   rm -rf "$state/obj"
   rm -f "$sb"/media/*.transcript.*
   printf 'COMPLETED\n' > "$state/status-seq"

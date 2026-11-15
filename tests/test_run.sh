@@ -40,15 +40,22 @@ perm=$(ls -l "$sb/media/talk.transcript.txt" | cut -c1-10)
 perm=$(ls -l "$sb/media/talk.transcript.json" | cut -c1-10)
 [ "$perm" = '-rw-------' ] && ok 'json file is owner-only' || bad "json file permissions are $perm"
 
+left=0
+for p in "$state"/obj/*; do [ -e "$p" ] && left=$((left + 1)); done
+[ "$left" -eq 0 ] && ok 'no object is left in the bucket (the access check file included)' || bad "$left objects left in the bucket"
+
 # call sequence and arguments
 expect_before 'checks the account before uploading' 'sts' 's3api] [put-object'
 expect_before 'uploads before starting the job' 'put-object' 'start-transcription-job'
 expect_before 'starts before fetching the result' 'start-transcription-job' 'get-object'
 expect_before 'fetches the result before any cleanup' 'get-object' 'delete-transcription-job'
-expect_before 'deletes the job before the last cleanup call' 'delete-transcription-job' 'delete-object'
+expect_before 'deletes the audio before the job' 'delete-object' 'delete-transcription-job'
+job_line=$(line_of 'delete-transcription-job')
+last_obj=$(last_line_of 'delete-object')
+[ "$job_line" -gt 0 ] && [ "$job_line" -lt "$last_obj" ] && ok 'deletes the job before the result object' || bad "job delete at $job_line, last object delete at $last_obj"
 expect_calls 'starts exactly one job' 1 'start-transcription-job'
 expect_calls 'deletes the job once' 1 'delete-transcription-job'
-expect_calls 'deletes the input and the output object' 2 'delete-object'
+expect_calls 'deletes the input, the access check file and the output object' 3 'delete-object'
 expect_call_has 'start passes ja-JP' start-transcription-job '[--language-code] [ja-JP]'
 expect_call_has 'start passes speaker labels with the default maximum' start-transcription-job '[--settings] [ShowSpeakerLabels=true,MaxSpeakerLabels=10]'
 expect_call_has 'start writes into our bucket' start-transcription-job "[--output-bucket-name] [$bucket]"
@@ -171,7 +178,7 @@ run_wrapper run "$f"
 expect_code 'upload failure exits 1' 1
 expect_calls 'upload failure never starts a job' 0 'start-transcription-job'
 expect_calls 'upload failure deletes no job' 0 'delete-transcription-job'
-expect_calls 'upload failure still removes the possible objects' 2 'delete-object'
+expect_calls 'upload failure still removes the possible objects' 3 'delete-object'
 expect_calls 'upload is not retried' 1 'put-object'
 expect_no_file 'upload failure writes no json' "$sb/media/talk.transcript.json"
 
@@ -180,7 +187,7 @@ fresh
 run_wrapper run "$f"
 expect_code 'start failure exits 1' 1
 expect_calls 'start is not retried' 1 'start-transcription-job'
-expect_calls 'start failure removes the objects' 2 'delete-object'
+expect_calls 'start failure removes the objects' 3 'delete-object'
 expect_no_file 'start failure writes no json' "$sb/media/talk.transcript.json"
 
 fresh
@@ -190,7 +197,7 @@ run_wrapper run "$f"
 expect_code 'a FAILED job exits 1' 1
 expect_out 'shows the failure reason' 'input media file'
 expect_calls 'a FAILED job is deleted' 1 'delete-transcription-job'
-expect_calls 'a FAILED job removes the objects' 2 'delete-object'
+expect_calls 'a FAILED job removes the objects' 3 'delete-object'
 expect_calls 'a FAILED job is not restarted' 1 'start-transcription-job'
 expect_no_file 'a FAILED job writes no json' "$sb/media/talk.transcript.json"
 
@@ -199,14 +206,14 @@ fresh
 run_wrapper run "$f"
 expect_code 'a status check failure exits 1' 1
 expect_calls 'a status check failure still deletes the job' 1 'delete-transcription-job'
-expect_calls 'a status check failure removes the objects' 2 'delete-object'
+expect_calls 'a status check failure removes the objects' 3 'delete-object'
 
 fresh
 : > "$state/fail-get-object"
 run_wrapper run "$f"
 expect_code 'a result download failure exits 1' 1
 expect_calls 'a download failure still deletes the job' 1 'delete-transcription-job'
-expect_calls 'a download failure removes the objects' 2 'delete-object'
+expect_calls 'a download failure removes the objects' 3 'delete-object'
 expect_no_file 'a download failure writes no json' "$sb/media/talk.transcript.json"
 expect_no_file 'a download failure writes no text' "$sb/media/talk.transcript.txt"
 
@@ -250,7 +257,7 @@ wait "$pid"
 code=$?
 [ "$code" -ne 0 ] && ok "SIGTERM ends the run with a failure code ($code)" || bad 'SIGTERM exit code was 0'
 expect_calls 'SIGTERM still deletes the job' 1 'delete-transcription-job'
-expect_calls 'SIGTERM still removes the objects' 2 'delete-object'
+expect_calls 'SIGTERM still removes the objects' 3 'delete-object'
 
 # ---- git work tree warning ----
 fresh
@@ -262,12 +269,107 @@ expect_code 'a run inside a git work tree succeeds' 0
 expect_out 'warns when the output is not ignored by git' 'git'
 rm -f "$sb"/repo/*.transcript.*
 fresh
-printf '*.transcript.*\n' > "$sb/repo/.gitignore"
+printf '*.transcript.*\n*.corrected.txt\n*.corrections.json\n' > "$sb/repo/.gitignore"
 run_wrapper run "$sb/repo/talk.wav"
 expect_code 'a run inside an ignoring git work tree succeeds' 0
 expect_no_out 'does not warn when git ignores the output' 'WARNING'
 fresh
 run_wrapper run "$f"
 expect_no_out 'does not warn outside a git work tree' 'WARNING'
+
+# ---- review findings: cleanup under signals ----
+# wait_for_hang: waits until the fake aws says it is blocked.
+wait_for_hang() {
+  local _
+  for _ in $(seq 1 400); do
+    [ -e "$state/hanging" ] && return 0
+    sleep 0.05
+  done
+  return 1
+}
+
+# A signal that arrives while the job is being started: the job may exist on AWS, so it is deleted.
+fresh
+: > "$state/hang-start"
+(exec env PATH="$fakebin:$PATH" "${wenv[@]}" "$BASH" "$wrapper" run "$f" > "$sb/signal.out" 2>&1) &
+pid=$!
+wait_for_hang || bad 'the fake start never blocked'
+kill -TERM "$pid" 2> /dev/null
+: > "$state/release"
+wait "$pid"
+code=$?
+[ "$code" -ne 0 ] && ok "SIGTERM during start ends the run with a failure code ($code)" || bad 'SIGTERM during start exited 0'
+expect_calls 'SIGTERM during start still deletes the job' 1 'delete-transcription-job'
+expect_calls 'SIGTERM during start still removes the objects' 3 'delete-object'
+
+# A second signal during cleanup must not interrupt the cleanup.
+fresh
+: > "$state/hang-delete"
+(exec env PATH="$fakebin:$PATH" "${wenv[@]}" "$BASH" "$wrapper" run "$f" > "$sb/signal.out" 2>&1) &
+pid=$!
+wait_for_hang || bad 'the fake job delete never blocked'
+kill -TERM "$pid" 2> /dev/null
+sleep 0.1
+kill -TERM "$pid" 2> /dev/null
+sleep 0.1
+: > "$state/release"
+wait "$pid"
+code=$?
+expect_calls 'two signals during cleanup still remove both objects' 3 'delete-object'
+expect_calls 'two signals during cleanup still finish the job delete' 1 'delete-transcription-job'
+first_obj=$(line_of 'delete-object')
+job_del=$(line_of 'delete-transcription-job')
+[ "$first_obj" -gt 0 ] && [ "$first_obj" -lt "$job_del" ] && ok 'the audio is deleted before the job' || bad "delete-object at $first_obj, delete-transcription-job at $job_del"
+
+# A job that was not finished when cleanup ran may still write its output: say so.
+fresh
+printf 'IN_PROGRESS\n' > "$state/status-seq"
+run_wrapper run "$f"
+expect_code 'an unfinished job exits 1' 1
+expect_out 'an unfinished job names the output that may appear later' 'later'
+
+# ---- review findings: buckets with versioning keep deleted objects ----
+fresh
+: > "$state/versioned"
+run_wrapper run "$f"
+expect_code 'a versioned bucket exits 3 because deleted objects remain as old versions' 3
+expect_file 'a versioned bucket still gets the outputs' "$sb/media/talk.transcript.txt"
+expect_out 'a versioned bucket names the objects that remain' 'transcribe-skill/'
+expect_out 'a versioned bucket explains the cause' 'version'
+
+# ---- review findings: the user's HOME must not reach the AWS CLI or jq ----
+fresh
+mkdir -p "$sb/home/.aws/cli"
+printf '[toplevel]\nsts = !echo hijacked\n' > "$sb/home/.aws/cli/alias"
+printf 'def length: 0;\n' > "$sb/home/.jq"
+wenv+=("HOME=$sb/home")
+run_wrapper run "$f"
+expect_code 'a hostile HOME does not break the run' 0
+expected_txt='[00:00 spk_0] こんにちは。
+[00:04 spk_1] お願いします。
+[01:05 spk_0] はい。'
+[ "$(cat "$sb/media/talk.transcript.txt")" = "$expected_txt" ] && ok 'jq ignores ~/.jq' || bad 'jq read ~/.jq' "$(cat "$sb/media/talk.transcript.txt" 2> /dev/null)"
+envs=$(ls "$state"/env-*.txt | wc -l | tr -d ' ')
+real_home=$(grep -c -x -F -e "HOME=$sb/home" "$state"/env-*.txt | awk -F: '{s += $2} END {print s + 0}')
+[ "$real_home" -eq 0 ] && ok "no aws call sees the user's HOME ($envs calls)" || bad "$real_home aws calls saw HOME=$sb/home"
+base_env
+
+# ---- review findings: output names that are dangling links, and git coverage of every output ----
+fresh
+ln -s "$sb/nowhere" "$sb/media/talk.transcript.json"
+run_wrapper run "$f"
+expect_code 'a dangling link at an output name exits 2' 2
+expect_calls 'a dangling link makes no aws call' 0 'ARGV'
+rm -f "$sb/media/talk.transcript.json"
+
+fresh
+rm -rf "$sb/repo"
+mkdir -p "$sb/repo"
+cp "$f" "$sb/repo/talk.wav"
+git -C "$sb/repo" init -q 2> /dev/null
+printf '*.transcript.*\n' > "$sb/repo/.gitignore"
+run_wrapper run "$sb/repo/talk.wav"
+expect_code 'a run with only the transcript names ignored succeeds' 0
+expect_out 'warns when the corrected outputs are not ignored' 'WARNING'
 
 finish

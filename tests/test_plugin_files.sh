@@ -42,11 +42,13 @@ prefix=$(sed -n "s/^readonly KEY_PREFIX='\([^']*\)'.*/\1/p" "$wrapper")
 s3res=$(jq -r '.Statement[] | select(.Action | tostring | test("s3:")) | .Resource' "$refs/iam-policy.json")
 [ "$s3res" = "arn:aws:s3:::<BUCKET>/$prefix/*" ] && ok 'the S3 statement is limited to the script prefix' || bad "S3 resource is $s3res"
 trres=$(jq -r '.Statement[] | select(.Action | tostring | test("transcribe:")) | .Resource' "$refs/iam-policy.json")
-[ "$trres" = 'arn:aws:transcribe:<REGION>:<ACCOUNT_ID>:transcription-job/*' ] && ok 'the Transcribe statement is limited to jobs of one account and region' || bad "Transcribe resource is $trres"
+[ "$trres" = 'arn:aws:transcribe:<REGION>:<ACCOUNT_ID>:transcription-job/tsk-*' ] && ok 'the Transcribe statement is limited to the plugin job names of one account and region' || bad "Transcribe resource is $trres"
+grep -q -F 'JOB="tsk-$rid"' "$wrapper" && ok 'the script names its jobs tsk-<random>, as the policy expects' || bad 'the script job names do not start with tsk-'
 
 lp=$(jq -r '.Rules[0].Filter.Prefix' "$refs/bucket-lifecycle.json")
 [ "$lp" = "$prefix/" ] && ok 'the lifecycle rule covers the script prefix' || bad "lifecycle prefix is $lp"
 [ "$(jq '.Rules[0].Expiration.Days' "$refs/bucket-lifecycle.json")" = '1' ] && ok 'the lifecycle rule expires objects after 1 day' || bad 'lifecycle expiration is not 1 day'
+[ "$(jq '.Rules[0].NoncurrentVersionExpiration.NoncurrentDays' "$refs/bucket-lifecycle.json")" = '1' ] && ok 'the lifecycle rule expires old versions after 1 day' || bad 'noncurrent version expiration is not 1 day'
 [ "$(jq '.Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation' "$refs/bucket-lifecycle.json")" = '1' ] && ok 'the lifecycle rule aborts incomplete uploads after 1 day' || bad 'multipart abort is not 1 day'
 [ "$(jq -r '.Statement[0].Condition.Bool["aws:SecureTransport"]' "$refs/bucket-policy.json")" = 'false' ] && ok 'the bucket policy denies requests without TLS' || bad 'bucket policy does not deny non-TLS'
 
