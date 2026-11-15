@@ -1,0 +1,35 @@
+schema_version: "1.1"
+name: flags-uncertain-instead-of-guessing
+description: A synthetic transcript has a broken word with two plausible readings (トゥ枚 as 2 枚 or 10 枚) and a sentence that stops in the middle. The correct skill must not guess a reading or invent the missing end of the sentence, and must list the broken word as a flag for a person to check.
+tags: [correct, restraint]
+execution:
+  max_turns: 20
+  allowed_tools: [Read, Skill, Agent, Write, Bash]
+  prompt: |
+    talk.transcript.txt は、打ち合わせを音声認識にかけた書き起こしです。音声認識の誤りだけを直してください。
+context:
+  scaffold_script: scaffold.sh
+graders:
+  # Run with --scaffold --allow-tools Write Bash.
+  - name: corrected-file-written
+    type: file_exists
+    path: talk.corrected.txt
+  - name: leaves-the-broken-word-alone
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: 'トゥ枚印刷'
+  - name: does-not-complete-the-cut-sentence
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: '先方への連絡は[^\n]'
+    match: not_contains
+  - name: lists-the-broken-word-as-a-flag
+    type: regex
+    target: { source: file, path: talk.corrections.json }
+    pattern: '"flags":\s*\[[\s\S]*トゥ枚'
+  - name: skill-fired
+    type: tool_used
+    tool: Skill
+    input_match: correct
+    min: 1
+    arm: with-only

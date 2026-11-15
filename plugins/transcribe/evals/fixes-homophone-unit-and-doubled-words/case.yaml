@@ -1,0 +1,65 @@
+schema_version: "1.1"
+name: fixes-homophone-unit-and-doubled-words
+description: A synthetic transcript of a meeting about automating invoice entry has four recognition errors (検収 heard as 研修, 件 heard as 点, a sentence heard twice, 個人情報 heard with a doubled character). The correct skill must fix them in a new file, keep the speaker labels, and leave the original transcript alone.
+tags: [correct, fixes]
+execution:
+  max_turns: 20
+  allowed_tools: [Read, Skill, Agent, Write, Bash]
+  prompt: |
+    talk.transcript.txt は、請求書の入力作業を自動化する提案の打ち合わせを、音声認識にかけた書き起こしです。音声認識の誤りだけを直してください。
+context:
+  scaffold_script: scaffold.sh
+graders:
+  # Run with --scaffold --allow-tools Write Bash. Without them the transcript is missing or no file can be written.
+  - name: corrected-file-written
+    type: file_exists
+    path: talk.corrected.txt
+  - name: corrections-file-written
+    type: file_exists
+    path: talk.corrections.json
+  - name: fixes-the-homophone
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: '検収の流れ'
+  - name: wrong-homophone-gone
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: '研修の流れ'
+    match: not_contains
+  - name: fixes-the-unit
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: '1,250件'
+  - name: wrong-unit-gone
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: '1,250点'
+    match: not_contains
+  - name: removes-the-repeated-sentence
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: '確認します。確認します。'
+    match: not_contains
+  - name: fixes-the-doubled-character
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: '個人情報が入る'
+  - name: doubled-character-gone
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: '個人人情報'
+    match: not_contains
+  - name: keeps-the-speaker-labels
+    type: regex
+    target: { source: file, path: talk.corrected.txt }
+    pattern: '\[00:25 spk_0\] ありがとうございます'
+  - name: leaves-the-original-alone
+    type: regex
+    target: { source: file, path: talk.transcript.txt }
+    pattern: '研修の流れ'
+  - name: skill-fired
+    type: tool_used
+    tool: Skill
+    input_match: correct
+    min: 1
+    arm: with-only
