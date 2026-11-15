@@ -1,15 +1,15 @@
-# transcribe
+# transcribe-proof
 
 音声と動画を Amazon Transcribe で日本語に書き起こし、誤認識だけを別の Claude が直す Claude Code のプラグイン。1 つのリポジトリがマーケットプレイスとプラグインを兼ねる。利用者は、作者以外の人を前提にする。作者の環境（広い権限の鍵が標準の環境変数にある、など）に依存する手順を、スキルや README に書かない。
 
 ## 構成
 
 - `.claude-plugin/marketplace.json`: マーケットプレイスの定義。version は書かない
-- `plugins/transcribe/.claude-plugin/plugin.json`: プラグインの定義。version はここにだけ書く
-- `plugins/transcribe/scripts/transcribe.sh`: AWS に触れる唯一の入口。`estimate`・`run`・`verify`・`apply` の 4 つ。bash 3.2（macOS の既定）で動くように書く
-- `plugins/transcribe/skills/{transcribe,correct,verify,setup}/SKILL.md`: スキル。`setup/references/` に、IAM のポリシー、バケットの設定、管理者向けの文書
-- `plugins/transcribe/agents/corrector.md`: 修正役。`tools` は `Read` だけ
-- `plugins/transcribe/evals/`: 誤認識の修正の評価ケース
+- `plugins/transcribe-proof/.claude-plugin/plugin.json`: プラグインの定義。version はここにだけ書く
+- `plugins/transcribe-proof/scripts/transcribe.sh`: AWS に触れる唯一の入口。`estimate`・`run`・`verify`・`apply` の 4 つ。bash 3.2（macOS の既定）で動くように書く
+- `plugins/transcribe-proof/skills/{transcribe,correct,verify,setup}/SKILL.md`: スキル。`setup/references/` に、IAM のポリシー、バケットの設定、管理者向けの文書
+- `plugins/transcribe-proof/agents/corrector.md`: 修正役。`tools` は `Read` だけ
+- `plugins/transcribe-proof/evals/`: 誤認識の修正の評価ケース
 - `tests/`: スクリプトとファイル間の整合のテスト
 
 ## 変えてはいけない前提
@@ -46,8 +46,8 @@
 ## 評価ケース
 
 - 1 ケース 1 フォルダ。`case.yaml` と `scaffold.sh`。入力は、手で書いた合成の書き起こしで、依頼主の名前や実際の会話を入れない
-- 実行: `cd plugins/transcribe && claude plugin eval . --case <ケース名> --scaffold --allow-tools Write Bash --max-cost-usd <上限> --no-publish`。モデルを動かすので料金がかかる。実行の前に、見積もりを持ち主へ伝える
-- 結果は `plugins/transcribe/evals/results/` に出る。git には入らない
+- 実行: `cd plugins/transcribe-proof && claude plugin eval . --case <ケース名> --scaffold --allow-tools Write Bash --max-cost-usd <上限> --no-publish`。モデルを動かすので料金がかかる。実行の前に、見積もりを持ち主へ伝える
+- 結果は `plugins/transcribe-proof/evals/results/` に出る。git には入らない
 - 採点の正規表現は、手で書いた理想の答えを通して、通ることを確かめる。何もしない答えを通して、落ちることも確かめる
 - 修正の評価は、正解を見せない別の文脈で回す。同じ会話で正解を見たあとだと、結果が引きずられる
 

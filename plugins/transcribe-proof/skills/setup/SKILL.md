@@ -76,4 +76,4 @@ AskUserQuestion で、「自分で作れる（IAM とバケットを作る権限
 
 ### 7. 確かめる
 
-`/transcribe:verify` を案内する。
+`/transcribe-proof:verify` を案内する。

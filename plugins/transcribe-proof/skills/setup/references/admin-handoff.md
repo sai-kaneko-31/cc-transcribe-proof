@@ -75,4 +75,4 @@ AWS の AI サービスは、内容をサービスの改善のために保存す
 
 ## 確認
 
-依頼者が Claude Code で `/transcribe:verify` を実行します。環境変数、鍵の持ち主と権限の広さ、バケットの権限、Transcribe の 3 つの操作が確かめられます。
+依頼者が Claude Code で `/transcribe-proof:verify` を実行します。環境変数、鍵の持ち主と権限の広さ、バケットの権限、Transcribe の 3 つの操作が確かめられます。

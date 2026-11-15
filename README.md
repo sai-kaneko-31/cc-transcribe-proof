@@ -1,4 +1,4 @@
-# transcribe
+# transcribe-proof
 
 音声と動画を、あなた自身の AWS アカウントの Amazon Transcribe で日本語に書き起こし、書き起こしの誤認識だけを別の Claude が直す Claude Code のプラグインです。
 
@@ -24,14 +24,14 @@ AWS と Anthropic の公式のものではなく、個人が作っています�
 Claude Code で、次の 2 つを実行します。
 
 ```text
-/plugin marketplace add sai-kaneko-31/cc-transcribe
-/plugin install transcribe@transcribe
+/plugin marketplace add sai-kaneko-31/cc-transcribe-proof
+/plugin install transcribe-proof@cc-transcribe-proof
 ```
 
 ## 準備
 
 ```text
-/transcribe:setup
+/transcribe-proof:setup
 ```
 
 AWS 側の準備を案内します。作るものは、専用の S3 バケット 1 つと、権限を絞った IAM ユーザー 1 つです。`setup` は AWS に何も作らず、鍵も扱いません。IAM を作れない人のために、管理者へ渡す文書も出します。
@@ -48,7 +48,7 @@ AWS 側の準備を案内します。作るものは、専用の S3 バケット
 設定したら、確認します。
 
 ```text
-/transcribe:verify
+/transcribe-proof:verify
 ```
 
 音声を送らずに、環境変数の形、鍵の持ち主、鍵が IAM のユーザー一覧を読めないこと、バケットの権限、バケットが versioning を有効にしていないこと、Transcribe の 3 つの操作（開始・取得・削除）を調べます。鍵が他のバケットの読み取りなどを持っていないことまでは、確かめません。
@@ -56,7 +56,7 @@ AWS 側の準備を案内します。作るものは、専用の S3 バケット
 ## 使い方
 
 ```text
-/transcribe:transcribe <音声か動画のファイル> [話題を 1 文] [話者は最大 N 人]
+/transcribe-proof:transcribe <音声か動画のファイル> [話題を 1 文] [話者は最大 N 人]
 ```
 
 実行のたびに、次を確かめます。音声の送り先（あなたの AWS アカウントの S3 と Amazon Transcribe）、書き起こしの本文の送り先（修正のために Claude）、概算の料金、依頼主の音声のときは契約が許すかどうか。同意が出るまで、音声は送られません。
@@ -73,7 +73,7 @@ AWS 側の準備を案内します。作るものは、専用の S3 バケット
 ほかのツールで作った書き起こしの、修正だけを使うこともできます。AWS には触れません。
 
 ```text
-/transcribe:correct <書き起こしのテキストファイル> [話題を 1 文]
+/transcribe-proof:correct <書き起こしのテキストファイル> [話題を 1 文]
 ```
 
 ## 内容の行き先と料金
@@ -118,13 +118,13 @@ AWS 側の準備を案内します。作るものは、専用の S3 バケット
 
 ```bash
 bash tests/run.sh
-shellcheck --severity=warning plugins/transcribe/scripts/*.sh tests/*.sh
+shellcheck --severity=warning plugins/transcribe-proof/scripts/*.sh tests/*.sh
 claude plugin validate .
 ```
 
 テストは、偽の `aws`、`ffprobe`、`sleep` を PATH の先頭に置いて回します。AWS のアカウントには触れません。`jq` が無い環境では、一部のテストが `SKIP` になり、その経路は確かめられていません。
 
-誤認識の修正の評価は、`plugins/transcribe/evals/` にあります。回し方は、そこの README にあります。
+誤認識の修正の評価は、`plugins/transcribe-proof/evals/` にあります。回し方は、そこの README にあります。
 
 ## ライセンス
 

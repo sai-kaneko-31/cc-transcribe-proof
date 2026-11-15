@@ -14,7 +14,7 @@ command -v jq > /dev/null 2>&1 || {
   exit 0
 }
 
-plugin="$root/plugins/transcribe"
+plugin="$root/plugins/transcribe-proof"
 refs="$plugin/skills/setup/references"
 
 frontmatter() { # prints the YAML block between the first two --- lines

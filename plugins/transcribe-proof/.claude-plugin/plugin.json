@@ -1,5 +1,5 @@
 {
-  "name": "transcribe",
+  "name": "transcribe-proof",
   "description": "音声と動画を、利用者自身の AWS アカウントの Amazon Transcribe で日本語に書き起こし、書き起こしの誤認識だけを別の Claude が直す。AWS への送信、料金、依頼主の音声の扱いを、実行のたびに確かめる",
   "version": "0.1.0",
   "author": {

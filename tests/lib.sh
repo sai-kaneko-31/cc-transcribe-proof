@@ -10,7 +10,7 @@
 # the wrapper's environment scrub.
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-wrapper="$root/plugins/transcribe/scripts/transcribe.sh"
+wrapper="$root/plugins/transcribe-proof/scripts/transcribe.sh"
 
 pass=0
 fail=0

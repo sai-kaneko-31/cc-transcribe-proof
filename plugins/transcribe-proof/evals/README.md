@@ -16,7 +16,7 @@
 実際にモデルを動かすので、料金がかかります。1 ケースずつ、上限を付けて回します。
 
 ```bash
-cd plugins/transcribe
+cd plugins/transcribe-proof
 claude plugin eval . --case fixes-homophone-unit-and-doubled-words --scaffold --allow-tools Write Bash --max-cost-usd 1 --no-publish
 ```
 
