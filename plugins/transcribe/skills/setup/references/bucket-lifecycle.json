@@ -1,0 +1,11 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-transcribe-skill",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "transcribe-skill/"},
+      "Expiration": {"Days": 1},
+      "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}
+    }
+  ]
+}
