@@ -92,7 +92,11 @@ setup_aws_env() {
 # aws and jq run with an empty HOME, so ~/.aws/cli/alias (which can replace a
 # command) and ~/.jq (which can redefine jq builtins) are never read.
 SAFE_HOME=''
-setup_safe_home() { SAFE_HOME=$(mktemp -d) || die 'cannot make a temporary directory'; }
+# make_temp [-d]: a temporary file or directory under TMPDIR. The template is
+# always given, because on macOS a bare `mktemp` ignores TMPDIR and writes to
+# the system temp directory, which a sandbox may not allow.
+make_temp() { mktemp "$@" "${TMPDIR:-/tmp}/transcribe.XXXXXX"; }
+setup_safe_home() { SAFE_HOME=$(make_temp -d) || die "cannot make a temporary directory under ${TMPDIR:-/tmp}"; }
 aws_call() { HOME="$SAFE_HOME" aws --region "$T_REGION" "$@"; }
 jq_safe() { HOME="$SAFE_HOME" jq "$@"; }
 
@@ -455,8 +459,8 @@ cmd_verify() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
   trap 'exit 129' HUP
-  TMP_TXT=$(mktemp) || die 'cannot make a temporary file'
-  TMP_JSON=$(mktemp) || die 'cannot make a temporary file'
+  TMP_TXT=$(make_temp) || die "cannot make a temporary file under ${TMPDIR:-/tmp}"
+  TMP_JSON=$(make_temp) || die "cannot make a temporary file under ${TMPDIR:-/tmp}"
   CLEANUP_NEEDED=1
 
   # A key that can list IAM users is broader than the plugin policy.

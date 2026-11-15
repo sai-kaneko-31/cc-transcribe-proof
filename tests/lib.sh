@@ -37,6 +37,28 @@ FAKE
 exit 0
 FAKE
 
+  # Like a sandbox that only lets a process write under its TMPDIR: on macOS a
+  # `mktemp` without a template ignores TMPDIR and uses the system temp
+  # directory, so the fake refuses that call. The templates it is given are
+  # logged in $state/mktemp.log.
+  cat > "$fakebin/mktemp" <<'FAKE'
+#!/usr/bin/env bash
+state='__STATE__'
+tmpl=''
+for a in "$@"; do
+  case "$a" in
+    -*) ;;
+    *) tmpl="$a" ;;
+  esac
+done
+if [ -z "$tmpl" ]; then
+  echo 'mktemp: mkdtemp failed on /var/folders/xx/T/tmp.XXXXXXXXXX: Operation not permitted' >&2
+  exit 1
+fi
+printf '%s\n' "$tmpl" >> "$state/mktemp.log"
+exec /usr/bin/mktemp "$@"
+FAKE
+
   cat > "$fakebin/aws" <<'FAKE'
 #!/usr/bin/env bash
 state='__STATE__'
@@ -157,7 +179,7 @@ esac
 FAKE
 
   local f
-  for f in ffprobe sleep aws; do
+  for f in ffprobe sleep mktemp aws; do
     sed -i.bak "s|__STATE__|$state|" "$fakebin/$f" && rm -f "$fakebin/$f.bak"
     chmod +x "$fakebin/$f"
   done
@@ -219,6 +241,20 @@ expect_calls() {
 key_id="AKIA""FAKEFAKEFAKEFAKE"
 secret=$(printf 'f%.0s' $(seq 1 40))
 bucket='fake-bucket-name'
+
+# expect_mktemp_under <label> <dir> [<other dir>]: the last run made temporary
+# files, and every template named a path under <dir> (or <other dir>, for the
+# files made next to the output).
+expect_mktemp_under() {
+  local label="$1" dir="$2" other="${3:-}" n_all n_bad
+  n_all=$(wc -l < "$state/mktemp.log" 2> /dev/null | tr -d ' ')
+  n_bad=$(awk -v d="$dir/" -v o="$other/" 'index($0, d) != 1 && (o == "/" || index($0, o) != 1)' "$state/mktemp.log" 2> /dev/null | wc -l | tr -d ' ')
+  if [ "${n_all:-0}" -gt 0 ] && [ "$n_bad" -eq 0 ]; then
+    ok "$label ($n_all temporary paths)"
+  else
+    bad "$label" "$n_all temporary paths, $n_bad outside $dir: $(cat "$state/mktemp.log" 2> /dev/null | tr '\n' ' ')"
+  fi
+}
 
 base_env() {
   wenv=("TRANSCRIBE_AWS_ACCESS_KEY_ID=$key_id" "TRANSCRIBE_AWS_SECRET_ACCESS_KEY=$secret"

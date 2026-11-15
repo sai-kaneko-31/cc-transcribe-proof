@@ -372,4 +372,14 @@ run_wrapper run "$sb/repo/talk.wav"
 expect_code 'a run with only the transcript names ignored succeeds' 0
 expect_out 'warns when the corrected outputs are not ignored' 'WARNING'
 
+# ---- a sandbox that only lets the process write under TMPDIR (the plugin eval runs like this) ----
+fresh
+rm -f "$state/mktemp.log"
+mkdir -p "$sb/tmpdir"
+wenv+=("TMPDIR=$sb/tmpdir")
+run_wrapper run "$f"
+expect_code 'run works when only TMPDIR is writable' 0
+expect_mktemp_under 'run makes its temporary files under TMPDIR' "$sb/tmpdir" "$sb/media"
+base_env
+
 finish

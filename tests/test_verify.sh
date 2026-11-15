@@ -183,4 +183,13 @@ expect_code 'verify passes with another HOME' 0
 home_hits=$(grep -c -x -F -e "HOME=$sb/home" "$state"/env-*.txt | awk -F: '{s += $2} END {print s + 0}')
 [ "$home_hits" -eq 0 ] && ok "no aws call sees the user's HOME" || bad "$home_hits aws calls saw the user's HOME"
 
+# ---- a sandbox that only lets the process write under TMPDIR (the plugin eval runs like this) ----
+ready
+rm -f "$state/mktemp.log"
+mkdir -p "$sb/tmpdir"
+wenv+=("TMPDIR=$sb/tmpdir")
+run_wrapper verify
+expect_code 'verify works when only TMPDIR is writable' 0
+expect_mktemp_under 'verify makes its temporary files under TMPDIR' "$sb/tmpdir"
+
 finish

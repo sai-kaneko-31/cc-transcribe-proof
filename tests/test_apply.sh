@@ -296,4 +296,15 @@ printf '*.transcript.*\n*.corrected.txt\n*.corrections.json\n' > "$sb/repo/.giti
 run_wrapper apply "$sb/repo/talk.transcript.txt" "$sb/edits.json"
 expect_no_out 'apply does not warn when git ignores them' 'WARNING'
 
+# a sandbox that only lets the process write under TMPDIR (the plugin eval runs like this)
+raw_transcript '[00:00 spk_0] 確認します。\n'
+edits '{"edits":[],"flags":[]}'
+rm -f "$state/mktemp.log"
+mkdir -p "$sb/tmpdir"
+wenv=("TMPDIR=$sb/tmpdir")
+apply
+expect_code 'apply works when only TMPDIR is writable' 0
+expect_mktemp_under 'apply makes its temporary files under TMPDIR' "$sb/tmpdir" "$sb/media"
+wenv=()
+
 finish
