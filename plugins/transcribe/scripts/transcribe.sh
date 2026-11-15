@@ -57,17 +57,25 @@ die() {
 warn() { printf 'transcribe: WARNING: %s\n' "$1" >&2; }
 
 # ---- plugin settings ----
+# config_problem: prints the first problem with the plugin's settings, or nothing.
+# Messages name the variable and never contain its value.
+config_problem() {
+  [ -n "$T_KEY_ID" ] || { echo 'TRANSCRIBE_AWS_ACCESS_KEY_ID is not set (run the setup skill for the steps)'; return; }
+  [ -n "$T_SECRET" ] || { echo 'TRANSCRIBE_AWS_SECRET_ACCESS_KEY is not set (run the setup skill for the steps)'; return; }
+  [ -n "$T_REGION" ] || { echo 'TRANSCRIBE_AWS_REGION is not set (run the setup skill for the steps)'; return; }
+  [ -n "$T_BUCKET" ] || { echo 'TRANSCRIBE_S3_BUCKET is not set (run the setup skill for the steps)'; return; }
+  [ "${#T_KEY_ID}" -eq 20 ] || { echo 'TRANSCRIBE_AWS_ACCESS_KEY_ID must be 20 characters'; return; }
+  [ "${#T_SECRET}" -eq 40 ] || { echo 'TRANSCRIBE_AWS_SECRET_ACCESS_KEY must be 40 characters'; return; }
+  [[ $T_KEY_ID =~ ^[A-Z0-9]{20}$ ]] || { echo 'TRANSCRIBE_AWS_ACCESS_KEY_ID has characters an access key ID does not have'; return; }
+  [[ $T_REGION =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]] || { echo 'TRANSCRIBE_AWS_REGION is not a region name such as ap-northeast-1'; return; }
+  [[ $T_BUCKET =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || { echo 'TRANSCRIBE_S3_BUCKET is not a bucket name (give the name only, without s3://)'; return; }
+  case "$T_BUCKET" in *..*) echo 'TRANSCRIBE_S3_BUCKET is not a bucket name (two dots in a row)' ;; esac
+}
+
 load_config() {
-  [ -n "$T_KEY_ID" ] || die 'TRANSCRIBE_AWS_ACCESS_KEY_ID is not set (run the setup skill for the steps)'
-  [ -n "$T_SECRET" ] || die 'TRANSCRIBE_AWS_SECRET_ACCESS_KEY is not set (run the setup skill for the steps)'
-  [ -n "$T_REGION" ] || die 'TRANSCRIBE_AWS_REGION is not set (run the setup skill for the steps)'
-  [ -n "$T_BUCKET" ] || die 'TRANSCRIBE_S3_BUCKET is not set (run the setup skill for the steps)'
-  [ "${#T_KEY_ID}" -eq 20 ] || die 'TRANSCRIBE_AWS_ACCESS_KEY_ID must be 20 characters'
-  [ "${#T_SECRET}" -eq 40 ] || die 'TRANSCRIBE_AWS_SECRET_ACCESS_KEY must be 40 characters'
-  [[ $T_KEY_ID =~ ^[A-Z0-9]{20}$ ]] || die 'TRANSCRIBE_AWS_ACCESS_KEY_ID has characters an access key ID does not have'
-  [[ $T_REGION =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]] || die 'TRANSCRIBE_AWS_REGION is not a region name such as ap-northeast-1'
-  [[ $T_BUCKET =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] || die 'TRANSCRIBE_S3_BUCKET is not a bucket name (give the name only, without s3://)'
-  case "$T_BUCKET" in *..*) die 'TRANSCRIBE_S3_BUCKET is not a bucket name (two dots in a row)' ;; esac
+  local problem
+  problem=$(config_problem)
+  [ -z "$problem" ] || die "$problem"
 }
 
 setup_aws_env() {
@@ -334,11 +342,268 @@ cmd_run() {
   exit 0
 }
 
+# ---- verify ----
+VERIFY_FAILED=0
+
+# check_ok / check_ng are called directly (never inside a command substitution),
+# so VERIFY_FAILED survives.
+check_ok() { printf 'check %s: ok%s\n' "$1" "${2:+ ($2)}"; }
+check_ng() {
+  printf 'check %s: NG %s\n' "$1" "$2"
+  VERIFY_FAILED=1
+}
+
+is_denied() { printf '%s' "$1" | grep -q 'AccessDenied'; }
+
+# Checks the setup end to end without sending any audio: the settings, who the
+# key belongs to, that the key is not broader than the plugin policy, bucket
+# access inside and outside the prefix, and the three Transcribe operations.
+# The Transcribe operations are tried on a text file posing as audio, which
+# makes a job that fails in seconds.
+cmd_verify() {
+  local problem arn rid prefix probe_key outside_key out rc polls status get_ok bucket_ok
+  problem=$(config_problem)
+  if [ -n "$problem" ]; then
+    check_ng env "$problem"
+    printf 'result=ng\n'
+    exit 2
+  fi
+  check_ok env
+  setup_aws_env
+
+  if ! ACCOUNT=$(aws_call sts get-caller-identity --query Account --output text 2> /dev/null) \
+    || ! [[ $ACCOUNT =~ ^[0-9]{12}$ ]] \
+    || ! arn=$(aws_call sts get-caller-identity --query Arn --output text 2> /dev/null); then
+    check_ng identity 'could not read the identity for these keys (wrong keys, wrong region setting, or no network)'
+    printf 'result=ng\n'
+    exit 1
+  fi
+  case "$arn" in
+    *:root) check_ng identity 'these are root user keys; create an IAM user for the plugin' ;;
+    *) check_ok identity "user ${arn##*/}" ;;
+  esac
+
+  rid=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+  [[ $rid =~ ^[0-9a-f]{16}$ ]] || die 'could not make a random ID' 1
+  prefix="$KEY_PREFIX/$rid"
+  probe_key="$prefix/verify/probe.txt"
+  outside_key="verify-outside-$rid.txt"
+  JOB="tsk-$rid"
+  IN_KEY="$prefix/probe/audio.wav"
+  OUT_KEY="$prefix/out/$JOB.json"
+
+  trap on_exit EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  TMP_TXT=$(mktemp) || die 'cannot make a temporary file'
+  TMP_JSON=$(mktemp) || die 'cannot make a temporary file'
+  CLEANUP_NEEDED=1
+
+  # A key that can list IAM users is broader than the plugin policy.
+  out=$(aws_call iam list-users --max-items 1 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    check_ng broad-key 'this key can list IAM users, so it is broader than the plugin policy; use a key limited to the plugin policy'
+  elif is_denied "$out"; then
+    check_ok broad-key 'iam:ListUsers is denied'
+  else
+    check_ng broad-key 'could not tell whether the key is broad (unexpected error from AWS)'
+  fi
+
+  bucket_ok=1
+  printf 'verify-%s\n' "$rid" > "$TMP_TXT"
+  aws_call s3api put-object --bucket "$T_BUCKET" --key "$probe_key" --body "$TMP_TXT" \
+    --expected-bucket-owner "$ACCOUNT" > /dev/null 2>&1 || bucket_ok=0
+  if [ "$bucket_ok" -eq 1 ]; then
+    aws_call s3api get-object --bucket "$T_BUCKET" --key "$probe_key" \
+      --expected-bucket-owner "$ACCOUNT" "$TMP_JSON" > /dev/null 2>&1 || bucket_ok=0
+    cmp -s "$TMP_JSON" "$TMP_TXT" || bucket_ok=0
+    aws_call s3api delete-object --bucket "$T_BUCKET" --key "$probe_key" \
+      --expected-bucket-owner "$ACCOUNT" > /dev/null 2>&1 || bucket_ok=0
+  fi
+  if [ "$bucket_ok" -eq 1 ]; then
+    check_ok bucket-rw "put, get and delete work under $KEY_PREFIX/"
+  else
+    check_ng bucket-rw "put, get or delete under $KEY_PREFIX/ failed; check the bucket name, the region and the Objects statement of the policy"
+  fi
+
+  out=$(aws_call s3api put-object --bucket "$T_BUCKET" --key "$outside_key" --body "$TMP_TXT" \
+    --expected-bucket-owner "$ACCOUNT" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    aws_call s3api delete-object --bucket "$T_BUCKET" --key "$outside_key" \
+      --expected-bucket-owner "$ACCOUNT" > /dev/null 2>&1
+    check_ng bucket-outside-prefix "the key can write outside $KEY_PREFIX/; narrow the policy to the prefix"
+  elif is_denied "$out"; then
+    check_ok bucket-outside-prefix "a write outside $KEY_PREFIX/ is denied"
+  else
+    check_ng bucket-outside-prefix 'could not tell (unexpected error from AWS)'
+  fi
+
+  out=$(aws_call s3api list-objects-v2 --bucket "$T_BUCKET" --max-keys 1 --expected-bucket-owner "$ACCOUNT" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    check_ng bucket-list 'the key can list the bucket; remove s3:ListBucket from the policy'
+  elif is_denied "$out"; then
+    check_ok bucket-list 'listing the bucket is denied'
+  else
+    check_ng bucket-list 'could not tell (unexpected error from AWS)'
+  fi
+
+  printf 'this is not audio\n' > "$TMP_TXT"
+  if ! aws_call s3api put-object --bucket "$T_BUCKET" --key "$IN_KEY" --body "$TMP_TXT" \
+    --expected-bucket-owner "$ACCOUNT" > /dev/null 2>&1; then
+    check_ng transcribe-start 'skipped: the probe upload failed'
+    check_ng transcribe-get 'skipped: the probe job did not start'
+    check_ng transcribe-delete 'skipped: the probe job did not start'
+  elif ! aws_call transcribe start-transcription-job --transcription-job-name "$JOB" \
+    --language-code ja-JP --media "MediaFileUri=s3://$T_BUCKET/$IN_KEY" \
+    --output-bucket-name "$T_BUCKET" --output-key "$prefix/out/" \
+    --query 'TranscriptionJob.TranscriptionJobStatus' --output text > /dev/null 2>&1; then
+    check_ng transcribe-start 'could not start a job; check transcribe:StartTranscriptionJob in the policy'
+    check_ng transcribe-get 'skipped: the probe job did not start'
+    check_ng transcribe-delete 'skipped: the probe job did not start'
+  else
+    JOB_CREATED=1
+    check_ok transcribe-start 'a job was created; it is expected to end FAILED because the file is not audio'
+    get_ok=0
+    polls=0
+    while [ "$polls" -lt 12 ]; do
+      if status=$(aws_call transcribe get-transcription-job --transcription-job-name "$JOB" \
+        --query 'TranscriptionJob.TranscriptionJobStatus' --output text 2> /dev/null); then
+        get_ok=1
+        case "$status" in
+          QUEUED | IN_PROGRESS)
+            polls=$((polls + 1))
+            sleep "$POLL_SECONDS"
+            ;;
+          *) break ;;
+        esac
+      else
+        break
+      fi
+    done
+    if [ "$get_ok" -eq 1 ]; then
+      check_ok transcribe-get 'the job status can be read'
+    else
+      check_ng transcribe-get 'could not read the job; check transcribe:GetTranscriptionJob in the policy'
+    fi
+    if aws_call transcribe delete-transcription-job --transcription-job-name "$JOB" > /dev/null 2>&1; then
+      JOB_CREATED=0
+      check_ok transcribe-delete 'the probe job was deleted'
+    else
+      check_ng transcribe-delete "could not delete the probe job $JOB; check transcribe:DeleteTranscriptionJob in the policy and delete the job by hand"
+    fi
+  fi
+
+  if [ "$VERIFY_FAILED" -eq 0 ]; then printf 'result=ok\n'; else printf 'result=ng\n'; fi
+  exit "$VERIFY_FAILED"
+}
+
+# ---- apply ----
+readonly MAX_TEXT_BYTES=2000000
+
+# Applies the corrector's edits to a transcript. The corrector can only Read, so
+# it returns edits as data; this program is the only thing that changes text.
+# An edit is applied only when it is well formed and its "old" text occurs
+# exactly once in the line; speaker labels are never touched; "new" cannot be
+# much longer than "old", so no new sentences can be slipped in.
+read -r -d '' APPLY_JQ <<'JQ'
+def prefix_of: capture("^(?<p>\\[[0-9]+:[0-9]{2} [^\\]]*\\] )?(?<b>.*)$");
+def line_ok($max): type == "number" and . == floor and . >= 1 and . <= $max;
+def reason_for($max):
+  if type != "object" then "the edit is not an object"
+  elif (.line | line_ok($max) | not) then "line is not a whole number within the transcript"
+  elif ((.old | type) != "string") or ((.new | type) != "string") then "old and new must be strings"
+  elif ((.reason | type) != "string") or (.reason == "") then "reason is missing"
+  elif (.confidence != "high" and .confidence != "medium") then "confidence must be high or medium (low confidence belongs in flags)"
+  elif .old == "" then "old is empty"
+  elif .old == .new then "old and new are the same"
+  elif (.old | test("\n")) or (.new | test("\n")) then "old or new has a line break"
+  elif (.new | length) > ((.old | length) * 3 + 20) then "new is too long compared with old"
+  else null end;
+[inputs] as $lines
+| $e[0] as $edits
+| ($lines | length) as $max
+| reduce ($edits.edits | to_entries[]) as $entry ({lines: $lines, applied: [], rejected: [], flags: []};
+    $entry.value as $x
+    | ($x | reason_for($max)) as $why
+    | if $why then .rejected += [{edit: $x, reason: $why}]
+      else
+        (.lines[$x.line - 1] | prefix_of) as $l
+        | (($l.b | split($x.old) | length) - 1) as $count
+        | if $count != 1 then
+            .rejected += [{edit: $x, reason: "old text not found exactly once in the line (found \($count) times)"}]
+          else
+            .lines[$x.line - 1] = (($l.p // "") + ($l.b | split($x.old) | join($x.new)))
+            | .applied += [$x]
+          end
+      end)
+| reduce $edits.flags[] as $f (.;
+    if ($f | type) == "object" and ($f.line | line_ok($max)) and (($f.text | type) == "string") and (($f.reason | type) == "string")
+    then .flags += [{line: $f.line, text: $f.text[0:200], reason: $f.reason[0:200]}]
+    else .rejected += [{flag: $f, reason: "the flag is malformed or its line is out of range"}]
+    end)
+JQ
+
+cmd_apply() {
+  local transcript="${1-}" editsfile="${2-}" f bytes dir base name out_corrected out_corrections result
+  [ -n "$transcript" ] && [ -n "$editsfile" ] || die 'usage: transcribe.sh apply <transcript.txt> <edits.json>'
+  command -v jq > /dev/null 2>&1 || die 'jq is required to apply the edits'
+  for f in "$transcript" "$editsfile"; do
+    [ -L "$f" ] && die "a symbolic link is not accepted: $f"
+    [ -f "$f" ] || die "no such file: $f"
+    bytes=$(wc -c < "$f" | tr -d ' ')
+    [ "$bytes" -le "$MAX_TEXT_BYTES" ] || die "the file is over $MAX_TEXT_BYTES bytes: $f"
+  done
+  jq -e 'type == "object" and (.edits | type) == "array" and (.flags | type) == "array"' "$editsfile" > /dev/null 2>&1 \
+    || die 'the edit file must be a JSON object with an "edits" array and a "flags" array'
+
+  dir=$(cd -P "$(dirname "$transcript")" 2> /dev/null && pwd) || die "cannot open the directory of: $transcript"
+  base=$(basename "$transcript")
+  case "$base" in
+    *.transcript.txt) name=${base%.transcript.txt} ;;
+    *.txt) name=${base%.txt} ;;
+    *) name=$base ;;
+  esac
+  out_corrected="$dir/$name.corrected.txt"
+  out_corrections="$dir/$name.corrections.json"
+  [ ! -e "$out_corrected" ] || die "the output already exists, not overwriting: $out_corrected"
+  [ ! -e "$out_corrections" ] || die "the output already exists, not overwriting: $out_corrections"
+
+  trap on_exit EXIT
+  TMP_TXT=$(mktemp "$dir/.transcribe.XXXXXX") || die "cannot write in the directory: $dir"
+  TMP_JSON=$(mktemp "$dir/.transcribe.XXXXXX") || die "cannot write in the directory: $dir"
+
+  result=$(jq -R -n --slurpfile e "$editsfile" "$APPLY_JQ" "$transcript") || die 'could not apply the edits' 1
+  printf '%s' "$result" | jq -r '.lines[]' > "$TMP_TXT" || die 'could not write the corrected text' 1
+  printf '%s' "$result" | jq '{applied, rejected, flags}' > "$TMP_JSON" || die 'could not write the corrections' 1
+  chmod 600 "$TMP_TXT" "$TMP_JSON"
+  mv "$TMP_TXT" "$out_corrected" || die 'could not write the corrected text' 1
+  TMP_TXT=''
+  mv "$TMP_JSON" "$out_corrections" || die 'could not write the corrections' 1
+  TMP_JSON=''
+
+  printf 'corrected_text=%s\n' "$out_corrected"
+  printf 'corrections_json=%s\n' "$out_corrections"
+  printf '%s' "$result" | jq -r '
+    "applied=\(.applied | length)",
+    "rejected=\(.rejected | length)",
+    "flagged=\(.flags | length)",
+    (.applied[] | "edit line \(.line): \(.old) -> \(.new) (\(.confidence): \(.reason))"),
+    (.rejected[] | "rejected: \(.reason): \((.edit // .flag) | tojson | .[0:160])"),
+    (.flags[] | "flag line \(.line): \(.text) (\(.reason))")'
+  exit 0
+}
+
 sub="${1-}"
 [ $# -gt 0 ] && shift
 case "$sub" in
   estimate) cmd_estimate "$@" ;;
   run) cmd_run "$@" ;;
-  '') die 'usage: transcribe.sh estimate <file> | run <file> [--max-speakers N]' ;;
+  verify) cmd_verify "$@" ;;
+  apply) cmd_apply "$@" ;;
+  '') die 'usage: transcribe.sh estimate <file> | run <file> [--max-speakers N] | verify | apply <transcript.txt> <edits.json>' ;;
   *) die "unknown subcommand: $sub" ;;
 esac

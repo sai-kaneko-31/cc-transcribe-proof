@@ -17,60 +17,6 @@ command -v jq > /dev/null 2>&1 || {
 make_sandbox
 trap cleanup_sandbox EXIT
 
-# Credential-shaped strings are assembled at run time so none sits in the repository.
-key_id="AKIA""FAKEFAKEFAKEFAKE"
-secret=$(printf 'f%.0s' $(seq 1 40))
-bucket='fake-bucket-name'
-
-base_env() {
-  wenv=("TRANSCRIBE_AWS_ACCESS_KEY_ID=$key_id" "TRANSCRIBE_AWS_SECRET_ACCESS_KEY=$secret"
-    "TRANSCRIBE_AWS_REGION=ap-northeast-1" "TRANSCRIBE_S3_BUCKET=$bucket")
-}
-
-fresh() {
-  rm -f "$state"/calls.log "$state"/env-*.txt "$state"/get-count "$state"/fail-* "$state"/broad-key
-  rm -f "$sb"/media/*.transcript.*
-  printf 'COMPLETED\n' > "$state/status-seq"
-  cat > "$state/result.json" <<'JSON'
-{"jobName":"x","accountId":"123456789012","results":{
- "transcripts":[{"transcript":"こんにちは。お願いします。はい。"}],
- "speaker_labels":{"speakers":2,"segments":[
-  {"start_time":"0.0","end_time":"3.5","speaker_label":"spk_0","items":[]},
-  {"start_time":"4.0","end_time":"6.0","speaker_label":"spk_1","items":[]},
-  {"start_time":"65.0","end_time":"69.0","speaker_label":"spk_0","items":[]}]},
- "items":[
-  {"start_time":"0.0","end_time":"3.5","type":"pronunciation","alternatives":[{"confidence":"0.9","content":"こんにちは"}]},
-  {"type":"punctuation","alternatives":[{"confidence":"0.0","content":"。"}]},
-  {"start_time":"4.0","end_time":"6.0","type":"pronunciation","alternatives":[{"confidence":"0.9","content":"お願いします"}]},
-  {"type":"punctuation","alternatives":[{"confidence":"0.0","content":"。"}]},
-  {"start_time":"65.0","end_time":"69.0","type":"pronunciation","alternatives":[{"confidence":"0.9","content":"はい"}]},
-  {"type":"punctuation","alternatives":[{"confidence":"0.0","content":"。"}]}]}}
-JSON
-}
-
-# call_line <op>: the calls.log lines for one operation name.
-call_line() { grep -F -e "[$1]" "$state/calls.log" 2> /dev/null; }
-
-# line_of <needle>: line number of the first calls.log line with the string (0 if none).
-line_of() { grep -n -F -e "$1" "$state/calls.log" 2> /dev/null | head -n 1 | cut -d: -f1 | grep . || echo 0; }
-
-# last_line_of <needle>
-last_line_of() { grep -n -F -e "$1" "$state/calls.log" 2> /dev/null | tail -n 1 | cut -d: -f1 | grep . || echo 0; }
-
-expect_call_has() { # label op needle
-  if call_line "$2" | grep -q -F -e "$3"; then ok "$1"; else bad "$1: no $2 call with '$3'" "$(cat "$state/calls.log" 2> /dev/null)"; fi
-}
-
-expect_before() { # label needleA needleB: first A comes before first B
-  local a b
-  a=$(line_of "$2")
-  b=$(line_of "$3")
-  if [ "$a" -gt 0 ] && [ "$b" -gt 0 ] && [ "$a" -lt "$b" ]; then ok "$1"; else bad "$1: '$2' at $a, '$3' at $b" "$(cat "$state/calls.log" 2> /dev/null)"; fi
-}
-
-expect_file() { if [ -f "$2" ]; then ok "$1"; else bad "$1: no file $2"; fi; }
-expect_no_file() { if [ -e "$2" ]; then bad "$1: found $2"; else ok "$1"; fi; }
-
 printf '60\n' > "$state/duration"
 f=$(media talk.wav)
 
@@ -210,6 +156,13 @@ expect_code 'existing text output exits 2' 2
 expect_calls 'existing output makes no aws call' 0 'ARGV'
 [ "$(cat "$sb/media/talk.transcript.txt")" = 'keep me' ] && ok 'existing output is untouched' || bad 'existing output was changed'
 rm -f "$sb/media/talk.transcript.txt"
+fresh
+printf 'keep me too\n' > "$sb/media/talk.transcript.json"
+run_wrapper run "$f"
+expect_code 'existing json output exits 2' 2
+expect_calls 'existing json output makes no aws call' 0 'ARGV'
+[ "$(cat "$sb/media/talk.transcript.json")" = 'keep me too' ] && ok 'existing json output is untouched' || bad 'existing json output was changed'
+rm -f "$sb/media/talk.transcript.json"
 
 # ---- failures: exit 1, no outputs, cleanup of what exists, no retry ----
 fresh

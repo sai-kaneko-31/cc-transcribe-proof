@@ -40,6 +40,15 @@ FAKE
   cat > "$fakebin/aws" <<'FAKE'
 #!/usr/bin/env bash
 state='__STATE__'
+# argval <option> <args...>: the value that follows the option.
+argval() {
+  local want="$1"
+  shift
+  while [ $# -gt 1 ]; do
+    [ "$1" = "$want" ] && { echo "$2"; return; }
+    shift
+  done
+}
 n=$(ls "$state" | grep -c '^env-')
 env | sort > "$state/env-$n.txt"
 {
@@ -58,7 +67,11 @@ case "$op" in
   'sts get-caller-identity')
     case "$args" in
       *Account*) echo '123456789012' ;;
-      *Arn*) echo 'arn:aws:iam::123456789012:user/fake-transcribe-user' ;;
+      *Arn*)
+        if [ -e "$state/root-arn" ]; then echo 'arn:aws:iam::123456789012:root'; else
+          echo 'arn:aws:iam::123456789012:user/fake-transcribe-user'
+        fi
+        ;;
       *) echo '{"Account":"123456789012"}' ;;
     esac
     ;;
@@ -68,14 +81,43 @@ case "$op" in
       exit 254
     fi
     ;;
-  's3api put-object') echo '{"ETag":"fake"}' ;;
+  's3api put-object')
+    key=$(argval --key "$@")
+    case "$key" in
+      transcribe-skill/*) ;;
+      *)
+        # like the shipped policy: only the plugin's prefix is writable
+        [ -e "$state/allow-outside-put" ] || {
+          echo 'An error occurred (AccessDenied) when calling the PutObject operation: fake denial' >&2
+          exit 254
+        }
+        ;;
+    esac
+    mkdir -p "$state/obj"
+    cp "$(argval --body "$@")" "$state/obj/$(printf '%s' "$key" | tr '/' '_')"
+    echo '{"ETag":"fake"}'
+    ;;
   's3api get-object')
     for last in "$@"; do :; done
-    [ -e "$state/result.json" ] || { echo 'no such key' >&2; exit 254; }
-    cp "$state/result.json" "$last"
+    saved="$state/obj/$(printf '%s' "$(argval --key "$@")" | tr '/' '_')"
+    if [ -e "$saved" ]; then
+      cp "$saved" "$last"
+    elif [ -e "$state/result.json" ]; then
+      cp "$state/result.json" "$last"
+    else
+      echo 'no such key' >&2
+      exit 254
+    fi
+    [ -e "$state/corrupt-get" ] && printf 'corrupted\n' > "$last"
     echo '{}'
     ;;
-  's3api delete-object') : ;;
+  's3api delete-object') rm -f "$state/obj/$(printf '%s' "$(argval --key "$@")" | tr '/' '_')" ;;
+  's3api list-objects-v2')
+    if [ -e "$state/allow-list" ]; then echo '{"Contents":[]}'; else
+      echo 'An error occurred (AccessDenied) when calling the ListObjectsV2 operation: fake denial' >&2
+      exit 254
+    fi
+    ;;
   'transcribe start-transcription-job') echo 'IN_PROGRESS' ;;
   'transcribe get-transcription-job')
     c=$(cat "$state/get-count" 2> /dev/null || echo 0)
@@ -148,6 +190,63 @@ expect_calls() {
   [ -n "$got" ] || got=0
   if [ "$got" -eq "$2" ]; then ok "$1"; else bad "$1: $got calls with '$3', want $2" "$(cat "$state/calls.log" 2> /dev/null)"; fi
 }
+
+# ---- helpers for tests that run the wrapper against the fake aws ----
+
+# Credential-shaped strings are assembled at run time so none sits in the repository.
+key_id="AKIA""FAKEFAKEFAKEFAKE"
+secret=$(printf 'f%.0s' $(seq 1 40))
+bucket='fake-bucket-name'
+
+base_env() {
+  wenv=("TRANSCRIBE_AWS_ACCESS_KEY_ID=$key_id" "TRANSCRIBE_AWS_SECRET_ACCESS_KEY=$secret"
+    "TRANSCRIBE_AWS_REGION=ap-northeast-1" "TRANSCRIBE_S3_BUCKET=$bucket")
+}
+
+fresh() {
+  rm -f "$state"/calls.log "$state"/env-*.txt "$state"/get-count "$state"/fail-* "$state"/broad-key "$state"/root-arn "$state"/corrupt-get "$state"/allow-*
+  rm -rf "$state/obj"
+  rm -f "$sb"/media/*.transcript.*
+  printf 'COMPLETED\n' > "$state/status-seq"
+  cat > "$state/result.json" <<'JSON'
+{"jobName":"x","accountId":"123456789012","results":{
+ "transcripts":[{"transcript":"こんにちは。お願いします。はい。"}],
+ "speaker_labels":{"speakers":2,"segments":[
+  {"start_time":"0.0","end_time":"3.5","speaker_label":"spk_0","items":[]},
+  {"start_time":"4.0","end_time":"6.0","speaker_label":"spk_1","items":[]},
+  {"start_time":"65.0","end_time":"69.0","speaker_label":"spk_0","items":[]}]},
+ "items":[
+  {"start_time":"0.0","end_time":"3.5","type":"pronunciation","alternatives":[{"confidence":"0.9","content":"こんにちは"}]},
+  {"type":"punctuation","alternatives":[{"confidence":"0.0","content":"。"}]},
+  {"start_time":"4.0","end_time":"6.0","type":"pronunciation","alternatives":[{"confidence":"0.9","content":"お願いします"}]},
+  {"type":"punctuation","alternatives":[{"confidence":"0.0","content":"。"}]},
+  {"start_time":"65.0","end_time":"69.0","type":"pronunciation","alternatives":[{"confidence":"0.9","content":"はい"}]},
+  {"type":"punctuation","alternatives":[{"confidence":"0.0","content":"。"}]}]}}
+JSON
+}
+
+# call_line <op>: the calls.log lines for one operation name.
+call_line() { grep -F -e "[$1]" "$state/calls.log" 2> /dev/null; }
+
+# line_of <needle>: line number of the first calls.log line with the string (0 if none).
+line_of() { grep -n -F -e "$1" "$state/calls.log" 2> /dev/null | head -n 1 | cut -d: -f1 | grep . || echo 0; }
+
+# last_line_of <needle>
+last_line_of() { grep -n -F -e "$1" "$state/calls.log" 2> /dev/null | tail -n 1 | cut -d: -f1 | grep . || echo 0; }
+
+expect_call_has() { # label op needle
+  if call_line "$2" | grep -q -F -e "$3"; then ok "$1"; else bad "$1: no $2 call with '$3'" "$(cat "$state/calls.log" 2> /dev/null)"; fi
+}
+
+expect_before() { # label needleA needleB: first A comes before first B
+  local a b
+  a=$(line_of "$2")
+  b=$(line_of "$3")
+  if [ "$a" -gt 0 ] && [ "$b" -gt 0 ] && [ "$a" -lt "$b" ]; then ok "$1"; else bad "$1: '$2' at $a, '$3' at $b" "$(cat "$state/calls.log" 2> /dev/null)"; fi
+}
+
+expect_file() { if [ -f "$2" ]; then ok "$1"; else bad "$1: no file $2"; fi; }
+expect_no_file() { if [ -e "$2" ]; then bad "$1: found $2"; else ok "$1"; fi; }
 
 finish() {
   echo "$pass passed, $fail failed"
