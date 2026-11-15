@@ -72,7 +72,7 @@ ${CLAUDE_PLUGIN_ROOT}/scripts/transcribe.sh run "<ファイル>" [--max-speakers
 
 手順 4 のコマンドが終わってから、Agent ツールで `transcribe-proof:corrector` を呼ぶ。AWS の後片付けを済ませてから、本文を初めてモデルに読ませるため。渡すのは、`transcript_text` のパスと、話題（あれば）だけ。修正役は Read しか使えず、ファイルを書き換えない。返ってくるのは、編集の JSON。
 
-返事を、JSON だけにして一時ファイルへ書く。置き場は、システムの一時ディレクトリ。書き起こしの隣や、git の作業ツリーの中には置かない。コードブロックの囲みが付いていたら外す。次のコマンドで当てる。
+返事を、JSON だけにして一時ファイルへ書く。編集は足さず、減らさず、書き換えない。確信度が `medium` の編集も、そのまま入れる。当てるかどうかは `apply` が決め、確信度は出力に残る。置き場は、システムの一時ディレクトリ。書き起こしの隣や、git の作業ツリーの中には置かない。コードブロックの囲みが付いていたら外す。次のコマンドで当てる。
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/scripts/transcribe.sh apply "<transcript_text のパス>" "<編集の JSON のパス>"
@@ -87,7 +87,7 @@ ${CLAUDE_PLUGIN_ROOT}/scripts/transcribe.sh apply "<transcript_text のパス>" 
 次を、利用者に短く伝える。本文は、利用者が求めるまで読み上げない。
 
 - 出力したファイルのパス 4 つ（`transcript_json`、`transcript_text`、`corrected_text`、`corrections_json`）
-- 直した箇所の数と一覧（行、元、直後、理由）
+- 直した箇所の数と一覧（行、元、直後、理由）。確信度が `medium` のもの（他の読みもありうる）には、そう書き添える
 - 当てられなかった編集の数と理由
 - 要確認の箇所（直さなかったもの）。人が確かめる
 - 修正は、誤認識の候補を直すもので、内容の正しさは保証しない。大事な数字や固有名詞は、録音で確かめる
