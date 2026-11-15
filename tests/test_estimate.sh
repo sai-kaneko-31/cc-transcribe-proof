@@ -100,6 +100,21 @@ expect_out 'says the size limit' 'size'
 run_wrapper estimate "$sb/media/empty.wav"
 expect_code 'empty file is rejected' 2
 
+# output paths and the git work tree flag
+f=$(media talk.wav)
+run_wrapper estimate "$f"
+expect_out 'prints the json output path' "output_json=$sb/media/talk.transcript.json"
+expect_out 'prints the text output path' "output_text=$sb/media/talk.transcript.txt"
+expect_out 'outside git, the git flag is no' 'output_in_unignored_git_worktree=no'
+mkdir -p "$sb/repo"
+cp "$f" "$sb/repo/talk.wav"
+git -C "$sb/repo" init -q 2> /dev/null
+run_wrapper estimate "$sb/repo/talk.wav"
+expect_out 'inside git and not ignored, the git flag is yes' 'output_in_unignored_git_worktree=yes'
+printf '*.transcript.*\n' > "$sb/repo/.gitignore"
+run_wrapper estimate "$sb/repo/talk.wav"
+expect_out 'inside git and ignored, the git flag is no' 'output_in_unignored_git_worktree=no'
+
 # unknown subcommand and no subcommand
 run_wrapper frobnicate
 expect_code 'unknown subcommand exits 2' 2

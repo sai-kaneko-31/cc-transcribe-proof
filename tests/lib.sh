@@ -17,7 +17,7 @@ fail=0
 
 # make_sandbox: creates $sb (scratch dir), $fakebin, $state and the fakes.
 make_sandbox() {
-  sb=$(mktemp -d)
+  sb=$(cd -P "$(mktemp -d)" && pwd) # resolved: the wrapper prints real paths (/var is /private/var on macOS)
   fakebin="$sb/fakebin"
   state="$sb/state"
   mkdir -p "$fakebin" "$state" "$sb/media"
@@ -47,6 +47,7 @@ env | sort > "$state/env-$n.txt"
   for a in "$@"; do printf ' [%s]' "$a"; done
   printf '\n'
 } >> "$state/calls.log"
+[ "$1" = '--region' ] && shift 2
 op="$1 $2"
 if [ -e "$state/fail-$2" ]; then
   echo "An error occurred (AccessDenied) when calling the $2 operation: fake denial" >&2
@@ -110,7 +111,7 @@ media() {
 # Sets $out (stdout and stderr together) and $code. Extra environment goes in
 # the array $wenv (name=value items).
 run_wrapper() {
-  out=$(env PATH="$fakebin:$PATH" ${wenv[@]+"${wenv[@]}"} bash "$wrapper" "$@" 2>&1)
+  out=$(env PATH="$fakebin:$PATH" ${wenv[@]+"${wenv[@]}"} "$BASH" "$wrapper" "$@" 2>&1)
   code=$?
 }
 
