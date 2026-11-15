@@ -1,0 +1,14 @@
+{
+  "name": "transcribe",
+  "description": "音声と動画を Amazon Transcribe で日本語に書き起こし、誤認識だけを直す Claude Code のプラグイン",
+  "owner": {
+    "name": "sai-kaneko-31"
+  },
+  "plugins": [
+    {
+      "name": "transcribe",
+      "source": "./plugins/transcribe",
+      "description": "音声と動画を Amazon Transcribe で日本語に書き起こし、誤認識だけを直す"
+    }
+  ]
+}
