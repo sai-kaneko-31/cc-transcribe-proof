@@ -7,6 +7,7 @@ execution:
   allowed_tools: [Read, Skill, Agent, Write, Bash]
   prompt: |
     talk.transcript.txt は、打ち合わせを音声認識にかけた書き起こしです。音声認識の誤りだけを直してください。
+    修正後の全文は、元のファイルとは別に talk.corrected.txt へ書いてください。元のファイルは変えないでください。
 context:
   scaffold_script: scaffold.sh
 graders:
@@ -27,6 +28,7 @@ graders:
     type: regex
     target: { source: file, path: talk.corrections.json }
     pattern: '"flags":\s*\[[\s\S]*トゥ枚'
+    arm: with-only
   - name: skill-fired
     type: tool_used
     tool: Skill
